@@ -1,15 +1,20 @@
 #!/bin/bash
-# Runs inside a Linux container that has the repo mounted at /src.
-# Produces bin/*.exe and target/x86_64-pc-windows-gnu/release/image-optimizer.exe.
+# Builds bin/*.exe and target/x86_64-pc-windows-gnu/release/image-optimizer.exe.
+# Runs as root in Docker, or with sudo on a GitHub Actions runner.
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y gcc-mingw-w64-x86-64 cmake make curl unzip python3 xz-utils pkg-config
+if [ "$(id -u)" -eq 0 ]; then
+  apt_get() { apt-get "$@"; }
+else
+  apt_get() { sudo apt-get "$@"; }
+fi
+apt_get update
+apt_get install -y gcc-mingw-w64-x86-64 cmake make curl unzip python3 xz-utils pkg-config
 
 rustup target add x86_64-pc-windows-gnu
 
-root=/src
+root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 third="$root/third_party"
 prefix="$third/win-install"
 mkdir -p "$third" "$prefix" "$root/bin"
@@ -23,12 +28,12 @@ fetch() {
 }
 
 CC=x86_64-w64-mingw32-gcc
-cat > "$third/mingw-toolchain.cmake" <<'EOF'
+cat > "$third/mingw-toolchain.cmake" <<EOF
 set(CMAKE_SYSTEM_NAME Windows)
 set(CMAKE_SYSTEM_PROCESSOR x86_64)
 set(CMAKE_C_COMPILER x86_64-w64-mingw32-gcc)
 set(CMAKE_RC_COMPILER x86_64-w64-mingw32-windres)
-set(CMAKE_FIND_ROOT_PATH /src/third_party/win-install)
+set(CMAKE_FIND_ROOT_PATH ${prefix})
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)

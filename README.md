@@ -22,6 +22,15 @@ The first launch unpacks the three tools into `~/.cache/image-optimizer/bin/`, a
 - Resize is off. Turn it on to shrink the long edge (1600 px) before encoding. That is the step that cuts multi‑megabyte photos down for the web.
 - Recommend compares candidates and picks the smaller format. WebP has to be at least 8% smaller than JPEG (photos) or PNG (graphics), and the winner has to save at least 3%, or the original is kept.
 
+## Releases
+
+Pushing a tag such as `v0.1.0` builds both binaries and attaches them to a GitHub release.
+
+- `image-optimizer-linux-x86_64`
+- `image-optimizer-windows-x86_64.exe`
+
+`chmod +x` the Linux file, then run it. On Windows, download the exe and double-click it.
+
 ## Build
 
 Linux, about 2 minutes if the tools are already built:
