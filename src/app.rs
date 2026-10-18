@@ -4,7 +4,7 @@ use crate::analyze::{self, ImageInfo};
 use crate::execute::{self, CancelFlag, OptimizeOutcome};
 use crate::files::{self, FilePrompt};
 use crate::model::{self, Decision, Recommendation, RowChoice};
-use crate::settings::Settings;
+use crate::settings::{Preset, Settings};
 use crate::tools::{self, ToolPaths};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -82,6 +82,7 @@ struct RowPatch {
 
 enum Msg {
     Row { gen: u64, index: usize, patch: RowPatch },
+    WorkingOn { gen: u64, index: usize, name: String },
     Finished { gen: u64 },
     Preview {
         path: PathBuf,
@@ -134,6 +135,9 @@ pub struct OptimizerApp {
     job_gen: u64,
     job_done: usize,
     job_total: usize,
+    job_settings: Option<Settings>,
+    active_file: String,
+    force_options_open: bool,
     cancel: Option<CancelFlag>,
     rx: Option<Receiver<Msg>>,
     tx: Sender<Msg>,
@@ -158,11 +162,12 @@ struct FileRow {
 
 impl OptimizerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let settings = cc
+        let mut settings = cc
             .storage
             .and_then(|storage| storage.get_string("settings"))
-            .and_then(|json| serde_json::from_str(&json).ok())
+            .and_then(|json| serde_json::from_str::<Settings>(&json).ok())
             .unwrap_or_default();
+        settings.sync_preset();
         let (tx, rx) = mpsc::channel();
         let tools = tools::locate();
         let log = match &tools {
@@ -182,6 +187,9 @@ impl OptimizerApp {
             job_gen: 0,
             job_done: 0,
             job_total: 0,
+            job_settings: None,
+            active_file: String::new(),
+            force_options_open: false,
             cancel: None,
             rx: Some(rx),
             tx,
@@ -240,6 +248,16 @@ impl OptimizerApp {
                         }
                     }
                 }
+                Msg::WorkingOn { gen, index, name } => {
+                    if gen == self.job_gen {
+                        self.active_file = name;
+                        if let Some(row) = self.rows.get_mut(index) {
+                            if row.output_path.is_none() && row.info.is_ok() {
+                                row.status = "Working".to_string();
+                            }
+                        }
+                    }
+                }
                 Msg::Finished { gen } => {
                     if gen == self.job_gen {
                         finished = true;
@@ -255,6 +273,7 @@ impl OptimizerApp {
         }
         if finished {
             self.running = false;
+            self.active_file.clear();
             let cancelled = self
                 .cancel
                 .as_ref()
@@ -262,6 +281,11 @@ impl OptimizerApp {
                 .unwrap_or(false);
             self.cancel = None;
             if cancelled {
+                for row in &mut self.rows {
+                    if row.status == "Working" {
+                        row.status = "Ready".to_string();
+                    }
+                }
                 self.log = "Stopped. You can optimize again.".to_string();
             } else {
                 self.log.clear();
@@ -323,6 +347,9 @@ impl OptimizerApp {
             status,
             command: String::new(),
         });
+        if self.selected.is_none() {
+            self.selected = Some(self.rows.len() - 1);
+        }
     }
 
     fn output_dir(&self) -> Option<PathBuf> {
@@ -348,11 +375,16 @@ impl OptimizerApp {
             return;
         };
         self.settings.clamp();
+        self.settings.sync_preset();
+        let stale = self.results_stale();
         let mut items = Vec::new();
         for (index, row) in self.rows.iter_mut().enumerate() {
             let Ok(info) = row.info.clone() else {
                 continue;
             };
+            if stale {
+                row.recommendation = None;
+            }
             row.output_bytes = None;
             row.output_path = None;
             row.status = "Queued".to_string();
@@ -373,6 +405,8 @@ impl OptimizerApp {
         let gen = self.job_gen;
         self.job_done = 0;
         self.job_total = items.len();
+        self.job_settings = Some(self.settings.clone());
+        self.active_file.clear();
         self.running = true;
         let cancel = CancelFlag::new();
         self.cancel = Some(cancel.clone());
@@ -383,14 +417,20 @@ impl OptimizerApp {
 
     fn counts(&self) -> (usize, usize) {
         let files = self.rows.iter().filter(|row| row.info.is_ok()).count();
-        let pending = self
-            .rows
-            .iter()
-            .filter(|row| {
-                row.info.is_ok() && row.output_path.is_none() && row.choice != RowChoice::Skip
-            })
-            .count();
+        let stale = self.results_stale();
+        let pending = self.rows.iter().filter(|row| needs_run(row, stale)).count();
         (files, pending)
+    }
+
+    fn results_stale(&self) -> bool {
+        self.job_settings
+            .as_ref()
+            .is_some_and(|applied| !applied.same_job(&self.settings))
+    }
+
+    fn step_now(&self) -> StepKind {
+        let (files, pending) = self.counts();
+        step_kind(self.tools.is_ok(), files, pending, self.running)
     }
 
     fn saved_line(&self) -> Option<String> {
@@ -436,8 +476,8 @@ impl OptimizerApp {
             });
         });
 
-        let (files, pending) = self.counts();
-        let kind = step_kind(self.tools.is_ok(), files, pending, self.running);
+        let files = self.counts().0;
+        let mut kind = self.step_now();
         let hovering = ctx.input(|input| !input.raw.hovered_files.is_empty());
 
         ui.add_space(8.0);
@@ -450,46 +490,85 @@ impl OptimizerApp {
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.vertical_centered(|ui| {
-                    ui.add_space(8.0);
+                    ui.add_space(4.0);
+                    if self.tools.is_ok() {
+                        self.preset_row(ui);
+                        kind = self.step_now();
+                        ui.add_space(10.0);
+                    }
+                    let wrote = self.rows.iter().any(|row| row.output_path.is_some());
+                    let all_skipped = files > 0
+                        && self
+                            .rows
+                            .iter()
+                            .filter(|row| row.info.is_ok())
+                            .all(|row| row.choice == RowChoice::Skip);
+                    let title = if matches!(kind, StepKind::Open) {
+                        finished_title(wrote, all_skipped, files)
+                    } else {
+                        step_title(kind, files)
+                    };
                     ui.label(
-                        egui::RichText::new(step_title(kind, files))
+                        egui::RichText::new(title)
                             .size(24.0)
                             .strong()
                             .color(ink_text()),
                     );
                     let detail = if hovering {
                         "Release to add these files."
+                    } else if matches!(kind, StepKind::Open) && !wrote {
+                        if all_skipped {
+                            "Skipped files stay as they are."
+                        } else {
+                            "Best kept the originals. Web can still shrink them."
+                        }
                     } else {
                         step_detail(kind)
                     };
                     if !detail.is_empty() {
                         ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(detail)
-                                .size(16.0)
-                                .color(body_text()),
+                        wrapped_label(ui, detail, 16.0, body_text());
+                    }
+                    if self.tools.is_ok() {
+                        ui.add_space(4.0);
+                        let done_dir = if matches!(kind, StepKind::Open) && wrote {
+                            self.output_dir()
+                        } else {
+                            None
+                        };
+                        let line = if matches!(kind, StepKind::Open) && !wrote {
+                            "Originals stay put.".to_string()
+                        } else {
+                            destination_text(done_dir.as_deref(), self.settings.output_dir.as_deref())
+                        };
+                        wrapped_label(ui, &line, 16.0, body_text());
+                    }
+                    if !self.running && self.results_stale() && self.rows.iter().any(has_previous_result)
+                    {
+                        ui.add_space(4.0);
+                        wrapped_label(
+                            ui,
+                            "These results used the previous settings. Optimize again to apply the new ones.",
+                            16.0,
+                            warn_text(),
                         );
                     }
                     if let Some(saved) = self.saved_line() {
-                        if matches!(kind, StepKind::Open) {
+                        if matches!(kind, StepKind::Open) && wrote {
                             ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(saved)
-                                    .size(16.0)
-                                    .color(body_text()),
-                            );
+                            wrapped_label(ui, &saved, 16.0, body_text());
                         }
                     }
                     if !self.log.is_empty() {
                         ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new(&self.log)
-                                .size(16.0)
-                                .color(egui::Color32::from_rgb(153, 27, 27)),
-                        );
+                        wrapped_label(ui, &self.log, 16.0, egui::Color32::from_rgb(153, 27, 27));
                     }
                     ui.add_space(14.0);
-                    let label = step_action(kind);
+                    let label = if matches!(kind, StepKind::Open) && !wrote {
+                        ""
+                    } else {
+                        step_action(kind)
+                    };
                     if !label.is_empty() && primary_button(ui, label).clicked() {
                         self.act(kind);
                     }
@@ -505,7 +584,11 @@ impl OptimizerApp {
                 self.job_done as f32 / self.job_total as f32
             };
             ui.add(
-                egui::ProgressBar::new(frac).text(format!("{} of {}", self.job_done, self.job_total)),
+                egui::ProgressBar::new(frac).text(progress_text(
+                    &self.active_file,
+                    self.job_done,
+                    self.job_total,
+                )),
             );
         }
 
@@ -519,38 +602,43 @@ impl OptimizerApp {
                     self.clear_rows();
                 }
             });
-            if !self.checked.is_empty() && !self.running {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(format!("{} selected", self.checked.len()));
-                    for (label, choice) in [
-                        ("Best", RowChoice::Recommended),
-                        ("JPEG", RowChoice::Jpeg),
-                        ("PNG", RowChoice::Png),
-                        ("WebP", RowChoice::Webp),
-                    ] {
-                        if ui.button(label).clicked() {
-                            let indexes: Vec<usize> = self.checked.iter().copied().collect();
-                            for index in indexes {
-                                self.set_choice(index, choice);
-                            }
-                        }
-                    }
+            ui.add_space(6.0);
+            ui.horizontal_top(|ui| {
+                let total = ui.available_width();
+                let preview_w = (total * 0.42).clamp(240.0, 420.0);
+                let list_w = (total - preview_w - 12.0).max(260.0);
+                ui.vertical(|ui| {
+                    ui.set_min_width(list_w);
+                    ui.set_max_width(list_w);
+                    ui.add_enabled_ui(!self.running, |ui| {
+                        self.format_bar(ui);
+                    });
+                    egui::ScrollArea::vertical()
+                        .id_salt("file_list")
+                        .max_height(420.0)
+                        .show(ui, |ui| {
+                            self.table(ui);
+                        });
                 });
-            }
-            egui::ScrollArea::vertical()
-                .max_height(280.0)
-                .show(ui, |ui| {
-                    self.table(ui);
+                ui.vertical(|ui| {
+                    ui.set_min_width(preview_w);
+                    ui.set_max_width(preview_w);
+                    self.preview_ui(ui, ctx);
                 });
-            self.preview_ui(ui, ctx);
+            });
         }
 
         ui.add_space(8.0);
-        egui::CollapsingHeader::new("Options")
-            .default_open(false)
-            .show(ui, |ui| {
+        let mut options = egui::CollapsingHeader::new("Options").default_open(false);
+        if self.force_options_open {
+            options = options.open(Some(true));
+            self.force_options_open = false;
+        }
+        options.show(ui, |ui| {
+            ui.add_enabled_ui(!self.running, |ui| {
                 self.settings_ui(ui);
             });
+        });
 
         if self.show_licenses {
             egui::Window::new("Licenses")
@@ -562,6 +650,76 @@ impl OptimizerApp {
                     });
                 });
         }
+    }
+
+    fn preset_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            for preset in Preset::ALL {
+                let on = self.settings.preset == preset;
+                let mut text = egui::RichText::new(preset.label()).size(16.0);
+                if on {
+                    text = text.strong().color(egui::Color32::WHITE);
+                }
+                let mut button = egui::Button::new(text).min_size(egui::vec2(112.0, 36.0));
+                if on {
+                    button = button.fill(accent());
+                }
+                if ui.add_enabled(!self.running, button).clicked() {
+                    self.pick_preset(preset);
+                }
+            }
+        });
+        ui.add_space(4.0);
+        wrapped_label(ui, self.settings.preset.detail(), 15.0, body_text());
+    }
+
+    fn pick_preset(&mut self, preset: Preset) {
+        if preset == Preset::Custom {
+            self.force_options_open = true;
+            return;
+        }
+        self.settings.apply_preset(preset);
+    }
+
+    fn format_targets(&self) -> Vec<usize> {
+        if !self.checked.is_empty() {
+            let mut indexes: Vec<usize> = self.checked.iter().copied().collect();
+            indexes.sort_unstable();
+            indexes
+        } else if let Some(index) = self.selected {
+            vec![index]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn format_bar(&mut self, ui: &mut egui::Ui) {
+        let targets = self.format_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let title = if !self.checked.is_empty() {
+            format!("Format for {} selected", self.checked.len())
+        } else {
+            format!(
+                "Format for {}",
+                self.rows
+                    .get(targets[0])
+                    .map(|row| file_label(&row.path))
+                    .unwrap_or_default()
+            )
+        };
+        let shared = shared_choice(&self.rows, &targets);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(title);
+            for choice in RowChoice::ALL {
+                if ui.selectable_label(shared == Some(choice), choice.label()).clicked() {
+                    for index in targets.clone() {
+                        self.set_choice(index, choice);
+                    }
+                }
+            }
+        });
     }
 
     fn act(&mut self, kind: StepKind) -> bool {
@@ -591,10 +749,7 @@ impl OptimizerApp {
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        ui.checkbox(
-            &mut self.settings.choose_best_format,
-            "Best uses a smaller format when it is clearly better",
-        );
+        option_group(ui, "Quality", true);
         ui.add_enabled(
             !self.settings.jpeg_lossless,
             egui::Slider::new(&mut self.settings.jpeg_quality, 0..=100).text("JPEG max quality"),
@@ -605,22 +760,38 @@ impl OptimizerApp {
             egui::Slider::new(&mut self.settings.webp_quality, 0..=100).text("WebP quality"),
         );
         ui.checkbox(&mut self.settings.webp_lossless, "Lossless WebP");
-        ui.checkbox(&mut self.settings.strip_metadata, "Strip metadata");
-        ui.checkbox(
-            &mut self.settings.png_brute,
-            "PNG maximum compression (slow)",
-        );
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.settings.resize_enabled, "Resize");
-            ui.add_enabled(
-                self.settings.resize_enabled,
-                egui::DragValue::new(&mut self.settings.resize_max_edge)
-                    .range(1..=20000)
-                    .suffix(" px longest side"),
-            );
+        ui.label("JPEG max quality only recompresses files saved above that value.");
+
+        option_group(ui, "Size", false);
+        ui.checkbox(&mut self.settings.resize_enabled, "Resize");
+        ui.horizontal_wrapped(|ui| {
+            for edge in [800_u32, 1600, 1920] {
+                let on = self.settings.resize_enabled && self.settings.resize_max_edge == edge;
+                let mut text = egui::RichText::new(format!("{edge} px"));
+                if on {
+                    text = text.color(egui::Color32::WHITE);
+                }
+                let mut button = egui::Button::new(text).min_size(egui::vec2(84.0, 28.0));
+                if on {
+                    button = button.fill(accent());
+                }
+                if ui.add(button).clicked() {
+                    self.settings.resize_enabled = true;
+                    self.settings.resize_max_edge = edge;
+                }
+            }
         });
-        ui.horizontal(|ui| {
-            ui.label("Output:");
+        ui.add_enabled(
+            self.settings.resize_enabled,
+            egui::DragValue::new(&mut self.settings.resize_max_edge)
+                .range(1..=20000)
+                .suffix(" px longest side"),
+        );
+        ui.label("1600 px is the Web preset. That is the step that shrinks phone photos.");
+
+        option_group(ui, "Files", false);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Output folder:");
             let text = self
                 .settings
                 .output_dir
@@ -635,8 +806,22 @@ impl OptimizerApp {
                 self.settings.output_dir = None;
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("Path:");
+        ui.checkbox(
+            &mut self.settings.strip_metadata,
+            "Strip metadata (removes camera and location data)",
+        );
+
+        option_group(ui, "Extra", false);
+        ui.checkbox(
+            &mut self.settings.choose_best_format,
+            "Best uses a smaller format when it is clearly better",
+        );
+        ui.checkbox(
+            &mut self.settings.png_brute,
+            "PNG maximum compression (slow)",
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Or path:");
             let entry = ui.add(
                 egui::TextEdit::singleline(&mut self.path_entry).desired_width(320.0),
             );
@@ -650,7 +835,36 @@ impl OptimizerApp {
                 }
             }
         });
-        ui.label("JPEG max quality only recompresses files saved above that value.");
+        ui.label("Command for the selected file");
+        let command_view = if self.rows.is_empty() {
+            None
+        } else {
+            self.selected.and_then(|index| self.rows.get(index)).map(|row| {
+                (row.command.clone(), row.status.clone(), row.choice)
+            })
+        };
+        if self.rows.is_empty() {
+            ui.label("Add a file, then optimize, to see its command.");
+        } else if let Some((command, status, choice)) = command_view {
+            if command.is_empty() {
+                if choice == RowChoice::Skip
+                    || matches!(
+                        status.as_str(),
+                        "Already small enough" | "Kept original" | "Skipped"
+                    )
+                {
+                    ui.label("No command. This file was kept as it is.");
+                } else {
+                    ui.label("Optimize this file to see its command.");
+                }
+            } else {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(command).monospace())
+                        .wrap_mode(egui::TextWrapMode::Wrap),
+                );
+            }
+        }
+        self.settings.sync_preset();
     }
 
     fn set_choice(&mut self, index: usize, choice: RowChoice) {
@@ -668,21 +882,24 @@ impl OptimizerApp {
     }
 
     fn table(&mut self, ui: &mut egui::Ui) {
+        let webp_lossless = self.settings.webp_lossless;
         egui::Grid::new("files")
             .striped(true)
-            .num_columns(5)
-            .spacing([16.0, 6.0])
+            .num_columns(4)
+            .spacing([12.0, 6.0])
             .show(ui, |ui| {
                 ui.strong("");
                 ui.strong("File");
                 ui.strong("Size");
-                ui.strong("Format");
                 ui.strong("Result");
                 ui.end_row();
 
                 for index in 0..self.rows.len() {
                     let mut on = self.checked.contains(&index);
-                    if ui.checkbox(&mut on, "").changed() {
+                    let response = ui
+                        .checkbox(&mut on, "")
+                        .on_hover_text("Check files to change them together");
+                    if response.changed() {
                         if on {
                             self.checked.insert(index);
                         } else {
@@ -690,33 +907,23 @@ impl OptimizerApp {
                         }
                         self.selected = Some(index);
                     }
-                    let name = self.rows[index]
-                        .path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| self.rows[index].path.display().to_string());
-                    ui.label(name);
+                    let selected = self.selected == Some(index);
+                    let name = file_label(&self.rows[index].path);
+                    if ui.selectable_label(selected, name).clicked() {
+                        self.selected = Some(index);
+                    }
                     let bytes = self.rows[index]
                         .info
                         .as_ref()
                         .map(|info| model::format_bytes(info.bytes))
                         .unwrap_or_else(|_| "—".to_string());
-                    ui.label(bytes);
-
-                    let mut choice = self.rows[index].choice;
-                    let previous = choice;
-                    egui::ComboBox::from_id_salt(index)
-                        .selected_text(choice.label())
-                        .show_ui(ui, |ui| {
-                            for option in RowChoice::ALL {
-                                ui.selectable_value(&mut choice, option, option.label());
-                            }
-                        });
-                    if choice != previous {
-                        self.set_choice(index, choice);
+                    if ui.selectable_label(selected, bytes).clicked() {
+                        self.selected = Some(index);
                     }
-
-                    ui.label(row_result(&self.rows[index]));
+                    let result = row_result(&self.rows[index], webp_lossless);
+                    if ui.selectable_label(selected, result).clicked() {
+                        self.selected = Some(index);
+                    }
                     ui.end_row();
                 }
             });
@@ -724,16 +931,30 @@ impl OptimizerApp {
 
     fn preview_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let Some(index) = self.selected else {
+            ui.label("Click a file to compare.");
             return;
         };
-        let Some(row) = self.rows.get(index) else {
-            return;
-        };
-        if row.info.is_err() || row.output_path.is_none() {
+        if self.rows.get(index).is_none() {
             return;
         }
-        let path = row.path.clone();
-        let output = row.output_path.clone();
+        if self.rows[index].info.is_err() {
+            ui.label(egui::RichText::new(file_label(&self.rows[index].path)).strong());
+            ui.label(&self.rows[index].status);
+            return;
+        }
+
+        let path = self.rows[index].path.clone();
+        let output = self.rows[index].output_path.clone();
+        let original_bytes = self.rows[index].info.as_ref().ok().map(|info| info.bytes);
+        let output_bytes = self.rows[index].output_bytes;
+        let after_caption = preview_after_caption(&self.rows[index], self.settings.webp_lossless);
+        let summary = self.rows[index]
+            .recommendation
+            .as_ref()
+            .map(|rec| rec.summary());
+        let stale_result = self.results_stale() && output_bytes.is_some();
+        let name = file_label(&path);
+
         if self.preview_path.as_ref() != Some(&path) || self.preview_output != output {
             self.preview_path = Some(path.clone());
             self.preview_output = output.clone();
@@ -748,29 +969,53 @@ impl OptimizerApp {
             });
             ctx.request_repaint();
         }
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
+
+        ui.label(egui::RichText::new(name).strong());
+        if stale_result {
+            ui.label(egui::RichText::new("Previous settings").color(warn_text()));
+        }
+        ui.add_space(6.0);
+        let col = (ui.available_width() / 2.0 - 8.0).max(80.0);
+        let before = self.before_tex.clone();
+        let after = self.after_tex.clone();
+        ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
-                ui.label("Original");
-                if let Some(tex) = &self.before_tex {
-                    ui.image(tex);
+                ui.set_width(col);
+                let caption = match original_bytes {
+                    Some(bytes) => format!("Original · {}", model::format_bytes(bytes)),
+                    None => "Original".to_string(),
+                };
+                ui.label(caption);
+                if let Some(tex) = &before {
+                    show_preview_image(ui, tex, col);
                 } else {
                     ui.label("Loading…");
                 }
             });
             ui.vertical(|ui| {
-                ui.label("Output");
-                if let Some(tex) = &self.after_tex {
-                    ui.image(tex);
+                ui.set_width(col);
+                ui.label(&after_caption);
+                if let Some(tex) = &after {
+                    show_preview_image(ui, tex, col);
                 } else if output.is_some() {
                     ui.label("Loading…");
-                } else {
+                } else if self.running {
+                    ui.label("Working…");
+                } else if after_caption == "Output" {
                     ui.label("Optimize to compare.");
+                } else if !matches!(
+                    after_caption.as_str(),
+                    "Already small enough" | "Kept original" | "Skipped" | "Skip"
+                ) {
+                    ui.label("No output file.");
                 }
             });
         });
-        if let Some(rec) = &self.rows[index].recommendation {
-            ui.label(rec.summary());
+        if let Some(summary) = summary {
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(summary).wrap_mode(egui::TextWrapMode::Wrap),
+            );
         }
     }
 }
@@ -778,6 +1023,7 @@ impl OptimizerApp {
 impl eframe::App for OptimizerApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.settings.clamp();
+        self.settings.sync_preset();
         if let Ok(json) = serde_json::to_string(&self.settings) {
             storage.set_string("settings", json);
         }
@@ -992,8 +1238,8 @@ fn step_title(kind: StepKind, files: usize) -> String {
 fn step_detail(kind: StepKind) -> &'static str {
     match kind {
         StepKind::NeedTools => "This copy of the app is missing its tools.",
-        StepKind::Add => "Drop a folder here, or use the button.",
-        StepKind::Optimize => "Best is the default. Set JPEG, PNG, or WebP on a row to keep that format.",
+        StepKind::Add => "JPEG, PNG, or WebP. Drop a folder here, or use the button.",
+        StepKind::Optimize => "Format buttons under the list override one file.",
         StepKind::Working => "",
         StepKind::Open => "",
     }
@@ -1020,6 +1266,10 @@ fn primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
         .fill(accent())
         .min_size(egui::vec2(240.0, 42.0)),
     )
+}
+
+fn warn_text() -> egui::Color32 {
+    egui::Color32::from_rgb(154, 52, 18)
 }
 
 fn accent() -> egui::Color32 {
@@ -1077,9 +1327,92 @@ fn apply_theme(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
-fn row_result(row: &FileRow) -> String {
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn needs_run(row: &FileRow, stale: bool) -> bool {
+    if row.info.is_err() || row.choice == RowChoice::Skip {
+        return false;
+    }
+    if stale {
+        return true;
+    }
+    !settled(row)
+}
+
+fn settled(row: &FileRow) -> bool {
+    row.output_path.is_some()
+        || matches!(
+            row.status.as_str(),
+            "Already small enough" | "Kept original" | "Skipped"
+        )
+}
+
+fn has_previous_result(row: &FileRow) -> bool {
+    row.output_bytes.is_some()
+        || matches!(
+            row.status.as_str(),
+            "Already small enough" | "Kept original"
+        )
+}
+
+fn finished_title(wrote: bool, all_skipped: bool, files: usize) -> String {
+    if !wrote && all_skipped {
+        "Nothing new to write".to_string()
+    } else if !wrote {
+        "These files are already small enough".to_string()
+    } else {
+        step_title(StepKind::Open, files)
+    }
+}
+
+fn destination_text(done_dir: Option<&Path>, chosen_dir: Option<&Path>) -> String {
+    if let Some(dir) = done_dir {
+        return format!("Originals stay put. Results are in {}.", dir.display());
+    }
+    if let Some(dir) = chosen_dir {
+        return format!("Originals stay put. Results go in {}.", dir.display());
+    }
+    "Originals stay put. Results go in optimized/ next to the first image.".to_string()
+}
+
+fn progress_text(name: &str, done: usize, total: usize) -> String {
+    if name.is_empty() {
+        format!("{done} of {total}")
+    } else {
+        format!("{name} · {done} of {total}")
+    }
+}
+
+fn format_label(row: &FileRow, webp_lossless: bool) -> String {
+    if let Some(rec) = &row.recommendation {
+        return rec.decision.label().to_string();
+    }
+    match row.choice {
+        RowChoice::Recommended => "Best".to_string(),
+        RowChoice::Jpeg => "JPEG".to_string(),
+        RowChoice::Png => "PNG".to_string(),
+        RowChoice::Webp => {
+            let alpha = row.info.as_ref().map(|info| info.has_alpha).unwrap_or(false);
+            if alpha || webp_lossless {
+                "WebP lossless".to_string()
+            } else {
+                "WebP".to_string()
+            }
+        }
+        RowChoice::Skip => "Skip".to_string(),
+    }
+}
+
+fn row_result(row: &FileRow, webp_lossless: bool) -> String {
     if row.info.is_err() {
         return row.status.clone();
+    }
+    if row.choice == RowChoice::Skip {
+        return "Skip".to_string();
     }
     if let Some(bytes) = row.output_bytes {
         let saved = row
@@ -1088,12 +1421,71 @@ fn row_result(row: &FileRow) -> String {
             .ok()
             .map(|info| format!(" · saved {:.0}%", model::saved_percent(info.bytes, bytes)))
             .unwrap_or_default();
-        return format!("{}{saved}", model::format_bytes(bytes));
+        let mut text = format!(
+            "{} · {}{saved}",
+            format_label(row, webp_lossless),
+            model::format_bytes(bytes)
+        );
+        if let Some(note) = row.status.strip_prefix("Done (") {
+            if let Some(note) = note.strip_suffix(')') {
+                if !note.is_empty() {
+                    text.push_str(" · ");
+                    text.push_str(note);
+                }
+            }
+        }
+        return text;
     }
-    if row.status != "Ready" && !row.status.is_empty() {
-        return row.status.clone();
+    if matches!(row.status.as_str(), "Ready" | "") {
+        return format_label(row, webp_lossless);
     }
-    "—".to_string()
+    row.status.clone()
+}
+
+fn preview_after_caption(row: &FileRow, webp_lossless: bool) -> String {
+    if row.output_bytes.is_some()
+        || (row.output_path.is_none()
+            && !matches!(row.status.as_str(), "Ready" | "Queued" | "Working" | ""))
+    {
+        return row_result(row, webp_lossless);
+    }
+    "Output".to_string()
+}
+
+fn shared_choice(rows: &[FileRow], indexes: &[usize]) -> Option<RowChoice> {
+    let mut indexes = indexes.iter();
+    let first = rows.get(*indexes.next()?)?.choice;
+    if indexes.all(|index| rows.get(*index).map(|row| row.choice) == Some(first)) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn option_group(ui: &mut egui::Ui, title: &str, first: bool) {
+    if !first {
+        ui.add_space(6.0);
+        ui.separator();
+    }
+    ui.strong(title);
+}
+
+fn wrapped_label(ui: &mut egui::Ui, text: &str, size: f32, color: egui::Color32) {
+    ui.add(
+        egui::Label::new(egui::RichText::new(text).size(size).color(color))
+            .wrap_mode(egui::TextWrapMode::Wrap),
+    );
+}
+
+fn show_preview_image(ui: &mut egui::Ui, tex: &egui::TextureHandle, max_width: f32) {
+    let size = tex.size_vec2();
+    let max = max_width.min(340.0);
+    let scale = if size.x > max && size.x > 0.0 {
+        max / size.x
+    } else {
+        1.0
+    };
+    ui.add(egui::Image::new((tex.id(), size * scale)));
 }
 
 fn run_job(
@@ -1128,6 +1520,16 @@ fn run_job(
                     break;
                 }
                 let item = &items[cursor];
+                let name = item
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| item.path.display().to_string());
+                let _ = tx.send(Msg::WorkingOn {
+                    gen,
+                    index: item.index,
+                    name,
+                });
                 let patch = optimize_item(&tools, &settings, item, &output_dir, &cancel);
                 let _ = tx.send(Msg::Row {
                     gen,
@@ -1311,5 +1713,101 @@ mod tests {
 
         assert_eq!(step_kind(false, 0, 0, false), StepKind::NeedTools);
         assert_eq!(step_action(StepKind::NeedTools), "");
+    }
+
+    fn sample_row(status: &str, output: bool, choice: RowChoice) -> FileRow {
+        FileRow {
+            path: std::path::PathBuf::from("photo.jpg"),
+            info: Ok(ImageInfo {
+                format: crate::model::SourceFormat::Jpeg,
+                width: 100,
+                height: 80,
+                has_alpha: false,
+                bytes: 2000,
+            }),
+            choice,
+            recommendation: None,
+            output_bytes: if output { Some(1000) } else { None },
+            output_path: if output {
+                Some(std::path::PathBuf::from("optimized/photo.jpg"))
+            } else {
+                None
+            },
+            status: status.to_string(),
+            command: String::new(),
+        }
+    }
+
+    #[test]
+    fn result_column_names_the_chosen_format() {
+        use crate::model::{Decision, Encode, WebpMode};
+        let mut row = sample_row("WebP", true, RowChoice::Recommended);
+        row.recommendation = Some(Recommendation {
+            decision: Decision::Use(Encode::Webp(WebpMode::Lossy)),
+            sizes: vec![(Encode::Webp(WebpMode::Lossy), 1000)],
+            photo: true,
+        });
+        assert_eq!(row_result(&row, false), "WebP · 1000 B · saved 50%");
+
+        let ready = sample_row("Ready", false, RowChoice::Recommended);
+        assert_eq!(row_result(&ready, false), "Best");
+
+        let jpeg = sample_row("Done (resized to 1600x900)", true, RowChoice::Jpeg);
+        assert_eq!(
+            row_result(&jpeg, false),
+            "JPEG · 1000 B · saved 50% · resized to 1600x900"
+        );
+        assert_eq!(
+            row_result(&sample_row("Ready", false, RowChoice::Skip), false),
+            "Skip"
+        );
+    }
+
+    #[test]
+    fn a_settings_change_asks_for_another_optimize() {
+        let done = sample_row("Done", true, RowChoice::Jpeg);
+        assert!(!needs_run(&done, false));
+        assert!(needs_run(&done, true));
+
+        let kept = sample_row("Already small enough", false, RowChoice::Recommended);
+        assert!(!needs_run(&kept, false));
+        assert!(needs_run(&kept, true));
+
+        assert!(needs_run(
+            &sample_row("pngcrush failed", false, RowChoice::Png),
+            false
+        ));
+        assert!(!needs_run(
+            &sample_row("Skipped", false, RowChoice::Skip),
+            true
+        ));
+
+        let mut broken = sample_row("not an image", false, RowChoice::Recommended);
+        broken.info = Err("not an image".to_string());
+        assert!(!needs_run(&broken, true));
+    }
+
+    #[test]
+    fn the_card_says_where_files_go() {
+        assert_eq!(
+            destination_text(None, None),
+            "Originals stay put. Results go in optimized/ next to the first image."
+        );
+        assert_eq!(
+            destination_text(Some(std::path::Path::new("/tmp/optimized")), None),
+            "Originals stay put. Results are in /tmp/optimized."
+        );
+        assert_eq!(
+            destination_text(None, Some(std::path::Path::new("/tmp/custom"))),
+            "Originals stay put. Results go in /tmp/custom."
+        );
+        assert_eq!(finished_title(true, false, 2), "Your images are ready");
+        assert_eq!(
+            finished_title(false, false, 2),
+            "These files are already small enough"
+        );
+        assert_eq!(finished_title(false, true, 2), "Nothing new to write");
+        assert_eq!(progress_text("a.jpg", 1, 4), "a.jpg · 1 of 4");
+        assert_eq!(progress_text("", 0, 4), "0 of 4");
     }
 }

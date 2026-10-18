@@ -4,9 +4,11 @@ One file. Nothing to install. It optimizes JPEG, PNG, and WebP with the real `jp
 
 ## Use it
 
-Linux / WSL: run `./image-optimizer`. Click **Add images**, pick a folder, then click **Optimize**. Results land in an `optimized` folder next to the first image. Originals stay untouched. Quality and format choices stay under **Options**.
+Linux / WSL: run `./image-optimizer`. Click **Add images**, pick a folder, then click **Optimize**. **Compress** keeps the full size. **Web** shrinks the long side to 1600 px. **Lossless** keeps full quality. **Custom** opens the sliders under **Options**.
 
-You can also type a path next to **Or path**, or drop files onto the window.
+Results land in an `optimized` folder next to the first image. Originals stay untouched. Click a file to compare before and after. Format buttons under the list override one file, or the files you checked. Changing a preset or a slider brings the button back to **Optimize**.
+
+You can also type a path next to **Or path** under **Options → Extra**, or drop files onto the window.
 
 Windows: run `image-optimizer.exe`. It uses the normal Windows file dialog.
 
@@ -14,12 +16,13 @@ The first launch unpacks the three tools into `~/.cache/image-optimizer/bin/`, a
 
 ## Defaults
 
+- **Compress** is the starting preset: full size, JPEG max quality 90, WebP quality 80, Best format. **Web** is the same with resize on at 1600 px. **Lossless** turns on lossless JPEG and lossless WebP. Any other slider change is **Custom**.
 - JPEG max quality is 90 (`jpegoptim --max=90`). Move the slider to change it. Lossless JPEG turns the cap off.
 - Files already saved at 90 or below are only optimized losslessly.
 - WebP quality is 80. Lossless WebP and images with transparency use `cwebp -lossless -z 6 -exact`.
 - PNG uses `pngcrush -reduce`. Maximum compression adds `-brute` and is slow.
 - Strip metadata is off.
-- Resize is off. Turn it on to shrink the long edge (1600 px) before encoding. That is the step that cuts multi‑megabyte photos down for the web.
+- Resize is off in **Compress**. **Web** turns it on at 1600 px. Size chips are 800, 1600, and 1920. That is what cuts multi‑megabyte photos down for the web.
 - Recommend compares candidates and picks the smaller format. WebP has to be at least 8% smaller than JPEG (photos) or PNG (graphics), and the winner has to save at least 3%, or the original is kept.
 
 ## Releases
