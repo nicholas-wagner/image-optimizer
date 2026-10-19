@@ -355,6 +355,7 @@ fn file_len(path: &Path) -> Result<u64, String> {
 
 /// jpegoptim, pngcrush, and cwebp are console programs. On Windows, spawning
 /// one opens a console window unless this flag is set.
+#[cfg_attr(not(windows), allow(dead_code))]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn hide_console(cmd: &mut Command) {

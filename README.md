@@ -4,19 +4,25 @@ One file. Nothing to install. It optimizes JPEG, PNG, and WebP with the real `jp
 
 ## Use it
 
-Linux / WSL: run `./image-optimizer`. Click **Add images**, pick a folder, then click **Optimize**. **Compress** keeps the full size. **Web** shrinks the long side to 1600 px. **Lossless** keeps full quality. **Custom** opens the sliders under **Options**.
+Linux / WSL: run `./image-optimizer`. The window opens in **Simple**.
 
-Results land in an `optimized` folder next to the first image. Originals stay untouched. Click a file to compare before and after. Format buttons under the list override one file, or the files you checked. Changing a preset or a slider brings the button back to **Optimize**.
+1. Pick a style. **Smaller file** keeps the full size. **For the web** shrinks the long side to 1600 px. **Perfect quality** does not reduce quality.
+2. Click **Add images** at the bottom, or drop files onto the window.
+3. Click **Optimize**.
 
-You can also type a path next to **Or path** under **Options → Extra**, or drop files onto the window.
+Originals stay untouched. Results land in an `optimized` folder next to the first image. Click a file to compare before and after. The same button stays at the bottom while you scroll.
+
+**Advanced**, in the header, opens the rest: quality sliders, resize, output folder, metadata, PNG maximum compression, per-file format (Best, JPEG, PNG, WebP, or Skip), add by path, and the command that ran. Check files to change their format together.
+
+**Your settings** appears when a control no longer matches a style. Picking a style again resets those controls and keeps the output folder. Changing a style or a slider brings the button back to **Optimize**.
 
 Windows: run `image-optimizer.exe`. It uses the normal Windows file dialog.
 
-The first launch unpacks the three tools into `~/.cache/image-optimizer/bin/`, and two small X11 libraries into `~/.cache/image-optimizer/lib/`. You do not place those files yourself.
+The first launch unpacks the three tools into `~/.cache/image-optimizer/bin/`. If `libxkbcommon-x11` or `libxcb-xkb` is missing, it also unpacks that library into `~/.cache/image-optimizer/lib/`. You do not place those files yourself.
 
 ## Defaults
 
-- **Compress** is the starting preset: full size, JPEG max quality 90, WebP quality 80, Best format. **Web** is the same with resize on at 1600 px. **Lossless** turns on lossless JPEG and lossless WebP. Any other slider change is **Custom**.
+- **Smaller file** (Compress) is the starting preset: full size, JPEG max quality 90, WebP quality 80, Best format. **For the web** (Web) is the same with resize on at 1600 px. **Perfect quality** (Lossless) turns on lossless JPEG and lossless WebP. Any other slider change is **Your settings** (Custom).
 - JPEG max quality is 90 (`jpegoptim --max=90`). Move the slider to change it. Lossless JPEG turns the cap off.
 - Files already saved at 90 or below are only optimized losslessly.
 - WebP quality is 80. Lossless WebP and images with transparency use `cwebp -lossless -z 6 -exact`.

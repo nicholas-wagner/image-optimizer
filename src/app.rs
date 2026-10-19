@@ -138,6 +138,8 @@ pub struct OptimizerApp {
     job_settings: Option<Settings>,
     active_file: String,
     force_options_open: bool,
+    advanced: bool,
+    coach_dismissed: bool,
     cancel: Option<CancelFlag>,
     rx: Option<Receiver<Msg>>,
     tx: Sender<Msg>,
@@ -174,6 +176,8 @@ impl OptimizerApp {
             Ok(_) => String::new(),
             Err(err) => err.clone(),
         };
+        let advanced = stored_flag(cc.storage, "advanced");
+        let coach_dismissed = stored_flag(cc.storage, "coach");
         apply_theme(&cc.egui_ctx);
         let mut app = Self {
             settings,
@@ -190,6 +194,8 @@ impl OptimizerApp {
             job_settings: None,
             active_file: String::new(),
             force_options_open: false,
+            advanced,
+            coach_dismissed,
             cancel: None,
             rx: Some(rx),
             tx,
@@ -407,6 +413,7 @@ impl OptimizerApp {
         self.job_total = items.len();
         self.job_settings = Some(self.settings.clone());
         self.active_file.clear();
+        self.log.clear();
         self.running = true;
         let cancel = CancelFlag::new();
         self.cancel = Some(cancel.clone());
@@ -451,12 +458,19 @@ impl OptimizerApp {
         if n == 0 {
             return None;
         }
-        Some(format!(
-            "Saved {:.0}% ({}) across {}.",
-            model::saved_percent(before, after),
-            model::format_bytes(before.saturating_sub(after)),
-            plural(n as usize, "image", "images")
-        ))
+        let pct = model::saved_percent(before, after);
+        if pct >= 1.0 {
+            Some(format!(
+                "Saved {pct:.0}% ({}) across {}.",
+                model::format_bytes(before.saturating_sub(after)),
+                plural(n as usize, "image", "images")
+            ))
+        } else {
+            Some(format!(
+                "Finished {}.",
+                plural(n as usize, "image", "images")
+            ))
+        }
     }
 
     fn open_output(&mut self) {
@@ -470,175 +484,220 @@ impl OptimizerApp {
         ui.horizontal(|ui| {
             ui.heading("Image Optimizer");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Licenses").clicked() {
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("Licenses").size(14.0)))
+                    .on_hover_text("Notices for the tools packed inside this app.")
+                    .clicked()
+                {
                     self.show_licenses = true;
+                }
+                ui.add_space(8.0);
+                if mode_switch(ui, &mut self.advanced) && self.advanced {
+                    self.force_options_open = true;
                 }
             });
         });
+        ui.label(
+            egui::RichText::new("Smaller copies. Your original files stay put.")
+                .size(14.0)
+                .color(muted_text()),
+        );
+
+        if !self.advanced && !self.coach_dismissed && self.tools.is_ok() && self.rows.is_empty()
+        {
+            ui.add_space(10.0);
+            self.coach_banner(ui);
+        }
 
         let files = self.counts().0;
         let mut kind = self.step_now();
         let hovering = ctx.input(|input| !input.raw.hovered_files.is_empty());
 
-        ui.add_space(8.0);
+        ui.add_space(12.0);
         let border = if hovering { accent() } else { card_stroke() };
         egui::Frame::NONE
             .fill(card_fill())
-            .stroke(egui::Stroke::new(1.5_f32, border))
-            .inner_margin(egui::Margin::same(20))
-            .corner_radius(egui::CornerRadius::same(10))
+            .stroke(egui::Stroke::new(if hovering { 2.0_f32 } else { 1.0_f32 }, border))
+            .inner_margin(egui::Margin::same(18))
+            .corner_radius(egui::CornerRadius::same(12))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                ui.vertical_centered(|ui| {
-                    ui.add_space(4.0);
-                    if self.tools.is_ok() {
+                if self.tools.is_ok() {
+                    ui.add_enabled_ui(!self.running, |ui| {
                         self.preset_row(ui);
-                        kind = self.step_now();
-                        ui.add_space(10.0);
-                    }
-                    let wrote = self.rows.iter().any(|row| row.output_path.is_some());
-                    let all_skipped = files > 0
-                        && self
-                            .rows
-                            .iter()
-                            .filter(|row| row.info.is_ok())
-                            .all(|row| row.choice == RowChoice::Skip);
-                    let title = if matches!(kind, StepKind::Open) {
+                    });
+                    kind = self.step_now();
+                    ui.add_space(if self.rows.is_empty() { 14.0 } else { 8.0 });
+                }
+                let wrote = self.rows.iter().any(|row| row.output_path.is_some());
+                let all_skipped = files > 0
+                    && self
+                        .rows
+                        .iter()
+                        .filter(|row| row.info.is_ok())
+                        .all(|row| row.choice == RowChoice::Skip);
+                let compact = !self.rows.is_empty() && !hovering;
+                ui.vertical_centered(|ui| {
+                    let kicker = if hovering {
+                        "Drop files"
+                    } else {
+                        step_kicker(kind, wrote)
+                    };
+                    ui.label(
+                        egui::RichText::new(kicker)
+                            .size(13.0)
+                            .strong()
+                            .color(accent()),
+                    );
+                    ui.add_space(2.0);
+                    let title = if hovering {
+                        "Drop to add these images".to_string()
+                    } else if matches!(kind, StepKind::Open) {
                         finished_title(wrote, all_skipped, files)
                     } else {
                         step_title(kind, files)
                     };
                     ui.label(
                         egui::RichText::new(title)
-                            .size(24.0)
+                            .size(if compact { 20.0 } else { 26.0 })
                             .strong()
                             .color(ink_text()),
                     );
-                    let detail = if hovering {
-                        "Release to add these files."
-                    } else if matches!(kind, StepKind::Open) && !wrote {
-                        if all_skipped {
-                            "Skipped files stay as they are."
+                    // Once files are listed, the footer and the list carry the detail.
+                    // Still explain a finished run that wrote nothing.
+                    let explain_empty = matches!(kind, StepKind::Open) && !wrote;
+                    if !compact || explain_empty {
+                        let detail = if hovering {
+                            "Release to add them to the list."
+                        } else if matches!(kind, StepKind::Open) && !wrote {
+                            if all_skipped {
+                                if self.advanced {
+                                    "Every file is set to skip. Choose Best above the list to include them."
+                                } else {
+                                    "Every file is set to skip. Switch to Advanced and choose Best to include them."
+                                }
+                            } else {
+                                "Nothing was smaller than the original, so no copies were written. Shrink for the web can still make them smaller."
+                            }
                         } else {
-                            "Best kept the originals. Web can still shrink them."
-                        }
-                    } else {
-                        step_detail(kind)
-                    };
-                    if !detail.is_empty() {
-                        ui.add_space(6.0);
-                        wrapped_label(ui, detail, 16.0, body_text());
-                    }
-                    if self.tools.is_ok() {
-                        ui.add_space(4.0);
-                        let done_dir = if matches!(kind, StepKind::Open) && wrote {
-                            self.output_dir()
-                        } else {
-                            None
+                            step_detail(kind)
                         };
-                        let line = if matches!(kind, StepKind::Open) && !wrote {
-                            "Originals stay put.".to_string()
-                        } else {
-                            destination_text(done_dir.as_deref(), self.settings.output_dir.as_deref())
-                        };
-                        wrapped_label(ui, &line, 16.0, body_text());
-                    }
-                    if !self.running && self.results_stale() && self.rows.iter().any(has_previous_result)
-                    {
-                        ui.add_space(4.0);
-                        wrapped_label(
-                            ui,
-                            "These results used the previous settings. Optimize again to apply the new ones.",
-                            16.0,
-                            warn_text(),
-                        );
-                    }
-                    if let Some(saved) = self.saved_line() {
-                        if matches!(kind, StepKind::Open) && wrote {
-                            ui.add_space(4.0);
-                            wrapped_label(ui, &saved, 16.0, body_text());
+                        if !detail.is_empty() {
+                            ui.add_space(6.0);
+                            wrapped_label(ui, detail, 16.0, body_text());
                         }
-                    }
-                    if !self.log.is_empty() {
                         ui.add_space(4.0);
-                        wrapped_label(ui, &self.log, 16.0, egui::Color32::from_rgb(153, 27, 27));
                     }
-                    ui.add_space(14.0);
-                    let label = if matches!(kind, StepKind::Open) && !wrote {
-                        ""
-                    } else {
-                        step_action(kind)
-                    };
-                    if !label.is_empty() && primary_button(ui, label).clicked() {
-                        self.act(kind);
-                    }
-                    ui.add_space(8.0);
                 });
             });
 
-        if self.running {
-            ui.add_space(8.0);
-            let frac = if self.job_total == 0 {
-                0.0
+        if !self.rows.is_empty() {
+            ui.add_space(12.0);
+            let list_caption = if files == self.rows.len() {
+                plural(files, "image", "images")
             } else {
-                self.job_done as f32 / self.job_total as f32
+                format!(
+                    "{} · {} not usable",
+                    plural(files, "image", "images"),
+                    self.rows.len() - files
+                )
             };
-            ui.add(
-                egui::ProgressBar::new(frac).text(progress_text(
-                    &self.active_file,
-                    self.job_done,
-                    self.job_total,
-                )),
-            );
-        }
-
-        if files > 0 {
-            ui.add_space(8.0);
             ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(list_caption)
+                        .strong()
+                        .size(16.0)
+                        .color(ink_text()),
+                );
                 if ui.button("Add more").clicked() && !self.running {
                     self.prompt_images();
                 }
-                if ui.button("Clear").clicked() && !self.running {
+                if ui
+                    .button("Remove all")
+                    .on_hover_text("Clears the list. Does not delete any files.")
+                    .clicked()
+                    && !self.running
+                {
                     self.clear_rows();
                 }
+                if self.advanced && !self.running {
+                    if ui.button("Check all").clicked() {
+                        self.checked = (0..self.rows.len()).collect();
+                    }
+                    if ui.button("Check none").clicked() {
+                        self.checked.clear();
+                    }
+                }
             });
-            ui.add_space(6.0);
-            ui.horizontal_top(|ui| {
-                let total = ui.available_width();
-                let preview_w = (total * 0.42).clamp(240.0, 420.0);
-                let list_w = (total - preview_w - 12.0).max(260.0);
-                ui.vertical(|ui| {
-                    ui.set_min_width(list_w);
-                    ui.set_max_width(list_w);
-                    ui.add_enabled_ui(!self.running, |ui| {
-                        self.format_bar(ui);
-                    });
-                    egui::ScrollArea::vertical()
-                        .id_salt("file_list")
-                        .max_height(420.0)
-                        .show(ui, |ui| {
-                            self.table(ui);
+            ui.add_space(8.0);
+            // A horizontal row that asks for the leftover viewport height collapses
+            // once the hero has filled the scroll area. This row grows with its contents.
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                ui.set_min_height(180.0);
+                let total = ui.available_width().max(520.0);
+                let preview_w = (total * 0.42).clamp(220.0, 420.0);
+                let list_w = (total - preview_w - 12.0).max(220.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(list_w, 180.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        panel_frame().show(ui, |ui| {
+                            ui.set_min_width(list_w - 2.0);
+                            if self.advanced {
+                                ui.add_enabled_ui(!self.running, |ui| {
+                                    self.format_bar(ui);
+                                });
+                                ui.add_space(6.0);
+                            } else {
+                                hint(ui, "Click a file to compare before and after.");
+                                ui.add_space(4.0);
+                            }
+                            egui::ScrollArea::vertical()
+                                .id_salt("file_list")
+                                .max_height(360.0)
+                                .show(ui, |ui| {
+                                    self.table(ui);
+                                });
                         });
-                });
-                ui.vertical(|ui| {
-                    ui.set_min_width(preview_w);
-                    ui.set_max_width(preview_w);
-                    self.preview_ui(ui, ctx);
-                });
+                    },
+                );
+                ui.allocate_ui_with_layout(
+                    egui::vec2(preview_w, 180.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        panel_frame().show(ui, |ui| {
+                            ui.set_min_width(preview_w - 2.0);
+                            self.preview_ui(ui, ctx);
+                        });
+                    },
+                );
             });
         }
 
-        ui.add_space(8.0);
-        let mut options = egui::CollapsingHeader::new("Options").default_open(false);
-        if self.force_options_open {
-            options = options.open(Some(true));
-            self.force_options_open = false;
-        }
-        options.show(ui, |ui| {
-            ui.add_enabled_ui(!self.running, |ui| {
-                self.settings_ui(ui);
+        ui.add_space(12.0);
+        if self.advanced {
+            let mut options = egui::CollapsingHeader::new("Advanced options").default_open(true);
+            if self.force_options_open {
+                options = options.open(Some(true));
+                self.force_options_open = false;
+            }
+            options.show(ui, |ui| {
+                ui.add_enabled_ui(!self.running, |ui| {
+                    self.settings_ui(ui);
+                });
             });
-        });
+        } else if self.tools.is_ok() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("Need quality, size, or format controls?")
+                        .color(muted_text()),
+                );
+                if ui.button("Open Advanced").clicked() {
+                    self.advanced = true;
+                    self.force_options_open = true;
+                }
+            });
+        }
 
         if self.show_licenses {
             egui::Window::new("Licenses")
@@ -650,35 +709,147 @@ impl OptimizerApp {
                     });
                 });
         }
+        ui.add_space(8.0);
+    }
+
+    fn coach_banner(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::NONE
+            .fill(egui::Color32::from_rgb(255, 247, 237))
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                egui::Color32::from_rgb(253, 186, 116),
+            ))
+            .inner_margin(egui::Margin::same(12))
+            .corner_radius(egui::CornerRadius::same(10))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Pick a style, add your images, then press the button at the bottom.");
+                    if ui.button("Got it").clicked() {
+                        self.coach_dismissed = true;
+                    }
+                });
+            });
     }
 
     fn preset_row(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            for preset in Preset::ALL {
-                let on = self.settings.preset == preset;
-                let mut text = egui::RichText::new(preset.label()).size(16.0);
-                if on {
-                    text = text.strong().color(egui::Color32::WHITE);
-                }
-                let mut button = egui::Button::new(text).min_size(egui::vec2(112.0, 36.0));
-                if on {
-                    button = button.fill(accent());
-                }
-                if ui.add_enabled(!self.running, button).clicked() {
-                    self.pick_preset(preset);
+        let presets = visible_presets(self.advanced, self.settings.preset);
+        let current = self.settings.preset;
+        let advanced = self.advanced;
+        let mut picked = None;
+        let previous_gap = ui.spacing().item_spacing.x;
+        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.columns(presets.len(), |cols| {
+            for (col, preset) in cols.iter_mut().zip(presets) {
+                if preset_card(col, preset, current == preset, advanced).clicked() {
+                    picked = Some(preset);
                 }
             }
         });
-        ui.add_space(4.0);
-        wrapped_label(ui, self.settings.preset.detail(), 15.0, body_text());
+        ui.spacing_mut().item_spacing.x = previous_gap;
+        if let Some(preset) = picked {
+            self.pick_preset(preset);
+        }
     }
 
     fn pick_preset(&mut self, preset: Preset) {
         if preset == Preset::Custom {
+            self.advanced = true;
             self.force_options_open = true;
             return;
         }
         self.settings.apply_preset(preset);
+    }
+
+    fn action_bar(&mut self, ui: &mut egui::Ui) {
+        let files = self.counts().0;
+        let kind = self.step_now();
+        let wrote = self.rows.iter().any(|row| row.output_path.is_some());
+        let all_skipped = files > 0
+            && self
+                .rows
+                .iter()
+                .filter(|row| row.info.is_ok())
+                .all(|row| row.choice == RowChoice::Skip);
+        let try_web = matches!(kind, StepKind::Open) && !wrote && !all_skipped;
+        let label = action_label(kind, wrote, all_skipped);
+        let stale = !self.running
+            && self.results_stale()
+            && self.rows.iter().any(has_previous_result);
+        let saved = self
+            .saved_line()
+            .filter(|_| matches!(kind, StepKind::Open) && wrote);
+        let status = if !self.log.is_empty() && !self.running {
+            self.log.clone()
+        } else if self.running {
+            progress_text(&self.active_file, self.job_done, self.job_total)
+        } else if let Some(saved) = &saved {
+            saved.clone()
+        } else if stale {
+            "Settings changed. Optimize again to apply them.".to_string()
+        } else if self.tools.is_err() {
+            "This copy of the app is missing its tools.".to_string()
+        } else if matches!(kind, StepKind::Open) && !wrote {
+            "Originals stay put.".to_string()
+        } else if files == 0 {
+            "Add images to begin. You can also drop them on this window.".to_string()
+        } else {
+            let done_dir = if matches!(kind, StepKind::Open) && wrote {
+                self.output_dir()
+            } else {
+                None
+            };
+            destination_text(done_dir.as_deref(), self.settings.output_dir.as_deref())
+        };
+        let status_color = if !self.log.is_empty() && !self.running {
+            log_color(&self.log)
+        } else if saved.is_some() {
+            good_text()
+        } else if stale {
+            warn_text()
+        } else {
+            body_text()
+        };
+        let running = self.running;
+        let frac = if self.job_total == 0 {
+            0.0
+        } else {
+            self.job_done as f32 / self.job_total as f32
+        };
+        let mut act = false;
+        let mut web = false;
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !label.is_empty() && primary_button(ui, label).clicked() {
+                if try_web {
+                    web = true;
+                } else {
+                    act = true;
+                }
+            }
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width());
+                if running {
+                    ui.add(egui::ProgressBar::new(frac).text(&status));
+                } else if saved.is_some() {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&status)
+                                .size(18.0)
+                                .strong()
+                                .color(status_color),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Wrap),
+                    );
+                } else {
+                    wrapped_label(ui, &status, 15.0, status_color);
+                }
+            });
+        });
+        if web {
+            self.settings.apply_preset(Preset::Web);
+            self.start_job();
+        } else if act {
+            self.act(kind);
+        }
     }
 
     fn format_targets(&self) -> Vec<usize> {
@@ -699,10 +870,10 @@ impl OptimizerApp {
             return;
         }
         let title = if !self.checked.is_empty() {
-            format!("Format for {} selected", self.checked.len())
+            format!("Save {} selected as", self.checked.len())
         } else {
             format!(
-                "Format for {}",
+                "Save {} as",
                 self.rows
                     .get(targets[0])
                     .map(|row| file_label(&row.path))
@@ -710,16 +881,52 @@ impl OptimizerApp {
             )
         };
         let shared = shared_choice(&self.rows, &targets);
+        ui.label(egui::RichText::new(title).strong());
         ui.horizontal_wrapped(|ui| {
-            ui.label(title);
             for choice in RowChoice::ALL {
-                if ui.selectable_label(shared == Some(choice), choice.label()).clicked() {
+                if ui
+                    .selectable_label(shared == Some(choice), choice.label())
+                    .on_hover_text(choice_tip(choice))
+                    .clicked()
+                {
                     for index in targets.clone() {
                         self.set_choice(index, choice);
                     }
                 }
             }
         });
+        hint(
+            ui,
+            "Check several rows to change them together. Skip leaves a file out.",
+        );
+    }
+
+    fn remove_row(&mut self, index: usize) {
+        if index >= self.rows.len() {
+            return;
+        }
+        self.rows.remove(index);
+        let mut next = HashSet::new();
+        for checked in &self.checked {
+            if *checked == index {
+                continue;
+            }
+            if *checked > index {
+                next.insert(checked - 1);
+            } else {
+                next.insert(*checked);
+            }
+        }
+        self.checked = next;
+        self.selected = if self.rows.is_empty() {
+            None
+        } else {
+            Some(index.min(self.rows.len() - 1))
+        };
+        self.before_tex = None;
+        self.after_tex = None;
+        self.preview_path = None;
+        self.preview_output = None;
     }
 
     fn act(&mut self, kind: StepKind) -> bool {
@@ -749,121 +956,198 @@ impl OptimizerApp {
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        option_group(ui, "Quality", true);
-        ui.add_enabled(
-            !self.settings.jpeg_lossless,
-            egui::Slider::new(&mut self.settings.jpeg_quality, 0..=100).text("JPEG max quality"),
+        hint(
+            ui,
+            "Changing a control below switches the style to Your settings. Switch back to Simple in the header when you are done. Your settings stay.",
         );
-        ui.checkbox(&mut self.settings.jpeg_lossless, "Lossless JPEG");
-        ui.add_enabled(
-            !self.settings.webp_lossless,
-            egui::Slider::new(&mut self.settings.webp_quality, 0..=100).text("WebP quality"),
-        );
-        ui.checkbox(&mut self.settings.webp_lossless, "Lossless WebP");
-        ui.label("JPEG max quality only recompresses files saved above that value.");
 
-        option_group(ui, "Size", false);
-        ui.checkbox(&mut self.settings.resize_enabled, "Resize");
-        ui.horizontal_wrapped(|ui| {
-            for edge in [800_u32, 1600, 1920] {
-                let on = self.settings.resize_enabled && self.settings.resize_max_edge == edge;
-                let mut text = egui::RichText::new(format!("{edge} px"));
-                if on {
-                    text = text.color(egui::Color32::WHITE);
-                }
-                let mut button = egui::Button::new(text).min_size(egui::vec2(84.0, 28.0));
-                if on {
-                    button = button.fill(accent());
-                }
-                if ui.add(button).clicked() {
-                    self.settings.resize_enabled = true;
-                    self.settings.resize_max_edge = edge;
-                }
+        group_card(ui, "Quality", |ui| {
+            let jpeg_on = !self.settings.jpeg_lossless;
+            ui.add_enabled(
+                jpeg_on,
+                egui::Slider::new(&mut self.settings.jpeg_quality, 0..=100).text("JPEG quality"),
+            );
+            if jpeg_on {
+                hint(ui, quality_hint(self.settings.jpeg_quality));
             }
+            ui.checkbox(
+                &mut self.settings.jpeg_lossless,
+                "Keep JPEG quality exact (no softness)",
+            );
+            if self.settings.jpeg_lossless {
+                hint(ui, "The file is only tidied. The picture does not change.");
+            } else {
+                hint(
+                    ui,
+                    "Files already saved at this quality or lower are left as they are.",
+                );
+            }
+            ui.add_space(6.0);
+            let webp_on = !self.settings.webp_lossless;
+            ui.add_enabled(
+                webp_on,
+                egui::Slider::new(&mut self.settings.webp_quality, 0..=100).text("WebP quality"),
+            );
+            if webp_on {
+                hint(ui, quality_hint(self.settings.webp_quality));
+            }
+            ui.checkbox(
+                &mut self.settings.webp_lossless,
+                "Keep WebP quality exact",
+            );
+            hint(
+                ui,
+                "Images with transparency always use lossless WebP, so the clear parts stay clear.",
+            );
         });
-        ui.add_enabled(
-            self.settings.resize_enabled,
-            egui::DragValue::new(&mut self.settings.resize_max_edge)
-                .range(1..=20000)
-                .suffix(" px longest side"),
-        );
-        ui.label("1600 px is the Web preset. That is the step that shrinks phone photos.");
 
-        option_group(ui, "Files", false);
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Output folder:");
+        group_card(ui, "Size", |ui| {
+            ui.checkbox(&mut self.settings.resize_enabled, "Shrink the long side");
+            ui.horizontal_wrapped(|ui| {
+                for edge in [800_u32, 1600, 1920] {
+                    let on = self.settings.resize_enabled && self.settings.resize_max_edge == edge;
+                    let mut text = egui::RichText::new(format!("{edge} px"));
+                    if on {
+                        text = text.color(egui::Color32::WHITE);
+                    }
+                    let mut button = egui::Button::new(text).min_size(egui::vec2(84.0, 30.0));
+                    if on {
+                        button = button.fill(accent());
+                    }
+                    let tip = match edge {
+                        800 => "Small, for thumbnails and tight pages.",
+                        1600 => "The For the web style. Enough for a normal page.",
+                        _ => "Sharper, for large layouts.",
+                    };
+                    if ui.add(button).on_hover_text(tip).clicked() {
+                        self.settings.resize_enabled = true;
+                        self.settings.resize_max_edge = edge;
+                    }
+                }
+            });
+            ui.add_enabled(
+                self.settings.resize_enabled,
+                egui::DragValue::new(&mut self.settings.resize_max_edge)
+                    .range(1..=20000)
+                    .suffix(" px longest side"),
+            );
+            hint(
+                ui,
+                "Phone photos are often 4000 px. 1600 px is what makes them small enough to send.",
+            );
+        });
+
+        group_card(ui, "Where files go", |ui| {
             let text = self
                 .settings
                 .output_dir
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "optimized folder next to the first image".to_string());
-            ui.label(text);
-            if ui.button("Change").clicked() {
-                self.prompt_output();
-            }
-            if self.settings.output_dir.is_some() && ui.button("Reset").clicked() {
-                self.settings.output_dir = None;
-            }
-        });
-        ui.checkbox(
-            &mut self.settings.strip_metadata,
-            "Strip metadata (removes camera and location data)",
-        );
-
-        option_group(ui, "Extra", false);
-        ui.checkbox(
-            &mut self.settings.choose_best_format,
-            "Best uses a smaller format when it is clearly better",
-        );
-        ui.checkbox(
-            &mut self.settings.png_brute,
-            "PNG maximum compression (slow)",
-        );
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Or path:");
-            let entry = ui.add(
-                egui::TextEdit::singleline(&mut self.path_entry).desired_width(320.0),
-            );
-            if (entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                || ui.button("Add").clicked()
-            {
-                let path = PathBuf::from(self.path_entry.trim());
-                if !path.as_os_str().is_empty() {
-                    self.add_path(path);
-                    self.path_entry.clear();
+            ui.label(egui::RichText::new(text).color(ink_text()));
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Choose folder").clicked() {
+                    self.prompt_output();
                 }
-            }
-        });
-        ui.label("Command for the selected file");
-        let command_view = if self.rows.is_empty() {
-            None
-        } else {
-            self.selected.and_then(|index| self.rows.get(index)).map(|row| {
-                (row.command.clone(), row.status.clone(), row.choice)
-            })
-        };
-        if self.rows.is_empty() {
-            ui.label("Add a file, then optimize, to see its command.");
-        } else if let Some((command, status, choice)) = command_view {
-            if command.is_empty() {
-                if choice == RowChoice::Skip
-                    || matches!(
-                        status.as_str(),
-                        "Already small enough" | "Kept original" | "Skipped"
-                    )
+                if self.settings.output_dir.is_some() && ui.button("Use the default folder").clicked()
                 {
-                    ui.label("No command. This file was kept as it is.");
-                } else {
-                    ui.label("Optimize this file to see its command.");
+                    self.settings.output_dir = None;
                 }
-            } else {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(command).monospace())
-                        .wrap_mode(egui::TextWrapMode::Wrap),
+            });
+            hint(
+                ui,
+                "Originals are never replaced. A result with the same name in the output folder is.",
+            );
+            ui.checkbox(
+                &mut self.settings.strip_metadata,
+                "Remove camera and location data",
+            );
+            hint(
+                ui,
+                "Strips hidden metadata. The picture looks the same.",
+            );
+        });
+
+        group_card(ui, "Expert", |ui| {
+            ui.checkbox(
+                &mut self.settings.choose_best_format,
+                "Compare formats and keep the smaller one",
+            );
+            if self.settings.choose_best_format {
+                hint(
+                    ui,
+                    "WebP is used only when it is at least 8% smaller than JPEG or PNG, and the winner has to save at least 3%.",
                 );
+            } else {
+                hint(ui, "Each file stays in its own format and is only recompressed.");
             }
-        }
+            ui.checkbox(
+                &mut self.settings.png_brute,
+                "PNG maximum compression (slow)",
+            );
+            hint(
+                ui,
+                "Tries many more PNG strategies. Useful for icons and screenshots. Slow on large photos.",
+            );
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Add by path").strong());
+            hint(ui, "A file or a folder. Press Enter to add it.");
+            ui.horizontal_wrapped(|ui| {
+                let entry = ui.add(
+                    egui::TextEdit::singleline(&mut self.path_entry)
+                        .desired_width(360.0)
+                        .hint_text("Paste a path"),
+                );
+                if (entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    || ui.button("Add").clicked()
+                {
+                    let path = PathBuf::from(self.path_entry.trim());
+                    if !path.as_os_str().is_empty() {
+                        self.add_path(path);
+                        self.path_entry.clear();
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Command for the selected file").strong());
+            let command_view = if self.rows.is_empty() {
+                None
+            } else {
+                self.selected
+                    .and_then(|index| self.rows.get(index))
+                    .map(|row| (row.command.clone(), row.status.clone(), row.choice))
+            };
+            if self.rows.is_empty() {
+                hint(ui, "Add a file, then optimize, to see its command.");
+            } else if let Some((command, status, choice)) = command_view {
+                if command.is_empty() {
+                    if choice == RowChoice::Skip
+                        || matches!(
+                            status.as_str(),
+                            "Already small enough" | "Kept original" | "Skipped"
+                        )
+                    {
+                        hint(ui, "No command. This file was kept as it is.");
+                    } else {
+                        hint(ui, "Optimize this file to see its command.");
+                    }
+                } else {
+                    if ui.button("Copy command").clicked() {
+                        ui.ctx().copy_text(command.clone());
+                    }
+                    egui::Frame::NONE
+                        .fill(egui::Color32::from_rgb(226, 232, 240))
+                        .inner_margin(egui::Margin::same(8))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(command).monospace().size(13.0))
+                                    .wrap_mode(egui::TextWrapMode::Wrap),
+                            );
+                        });
+                }
+            }
+        });
         self.settings.sync_preset();
     }
 
@@ -883,29 +1167,34 @@ impl OptimizerApp {
 
     fn table(&mut self, ui: &mut egui::Ui) {
         let webp_lossless = self.settings.webp_lossless;
+        let advanced = self.advanced;
         egui::Grid::new("files")
             .striped(true)
-            .num_columns(4)
-            .spacing([12.0, 6.0])
+            .num_columns(if advanced { 4 } else { 3 })
+            .spacing([12.0, 8.0])
             .show(ui, |ui| {
-                ui.strong("");
+                if advanced {
+                    ui.strong("");
+                }
                 ui.strong("File");
                 ui.strong("Size");
                 ui.strong("Result");
                 ui.end_row();
 
                 for index in 0..self.rows.len() {
-                    let mut on = self.checked.contains(&index);
-                    let response = ui
-                        .checkbox(&mut on, "")
-                        .on_hover_text("Check files to change them together");
-                    if response.changed() {
-                        if on {
-                            self.checked.insert(index);
-                        } else {
-                            self.checked.remove(&index);
+                    if advanced {
+                        let mut on = self.checked.contains(&index);
+                        let response = ui
+                            .checkbox(&mut on, "")
+                            .on_hover_text("Check files to change them together");
+                        if response.changed() {
+                            if on {
+                                self.checked.insert(index);
+                            } else {
+                                self.checked.remove(&index);
+                            }
+                            self.selected = Some(index);
                         }
-                        self.selected = Some(index);
                     }
                     let selected = self.selected == Some(index);
                     let name = file_label(&self.rows[index].path);
@@ -920,8 +1209,12 @@ impl OptimizerApp {
                     if ui.selectable_label(selected, bytes).clicked() {
                         self.selected = Some(index);
                     }
-                    let result = row_result(&self.rows[index], webp_lossless);
-                    if ui.selectable_label(selected, result).clicked() {
+                    let result = result_label(&self.rows[index], webp_lossless, advanced);
+                    let color = result_color(&self.rows[index]);
+                    if ui
+                        .selectable_label(selected, egui::RichText::new(result).color(color))
+                        .clicked()
+                    {
                         self.selected = Some(index);
                     }
                     ui.end_row();
@@ -938,14 +1231,21 @@ impl OptimizerApp {
             return;
         }
         if self.rows[index].info.is_err() {
+            ui.label(egui::RichText::new("Compare").strong().color(muted_text()));
+            ui.add_space(4.0);
             ui.label(egui::RichText::new(file_label(&self.rows[index].path)).strong());
-            ui.label(&self.rows[index].status);
+            ui.label(
+                egui::RichText::new(&self.rows[index].status)
+                    .color(egui::Color32::from_rgb(153, 27, 27)),
+            );
+            self.remove_button(ui, index);
             return;
         }
 
         let path = self.rows[index].path.clone();
         let output = self.rows[index].output_path.clone();
-        let original_bytes = self.rows[index].info.as_ref().ok().map(|info| info.bytes);
+        let info = self.rows[index].info.as_ref().ok().cloned();
+        let original_bytes = info.as_ref().map(|info| info.bytes);
         let output_bytes = self.rows[index].output_bytes;
         let after_caption = preview_after_caption(&self.rows[index], self.settings.webp_lossless);
         let summary = self.rows[index]
@@ -970,22 +1270,57 @@ impl OptimizerApp {
             ctx.request_repaint();
         }
 
-        ui.label(egui::RichText::new(name).strong());
-        if stale_result {
-            ui.label(egui::RichText::new("Previous settings").color(warn_text()));
+        ui.label(egui::RichText::new("Compare").strong().color(muted_text()));
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new(name).strong().size(16.0));
+        if let Some(info) = &info {
+            let mut line = format!(
+                "{} · {} × {}",
+                info.format.label(),
+                info.width,
+                info.height
+            );
+            if info.has_alpha {
+                line.push_str(" · has transparency");
+            }
+            hint(ui, &line);
         }
-        ui.add_space(6.0);
+        if let (Some(before_bytes), Some(after_bytes)) = (original_bytes, output_bytes) {
+            let pct = model::saved_percent(before_bytes, after_bytes);
+            ui.add_space(4.0);
+            if pct >= 1.0 {
+                ui.label(
+                    egui::RichText::new(format!("{pct:.0}% smaller"))
+                        .size(22.0)
+                        .strong()
+                        .color(good_text()),
+                );
+            } else if pct <= -1.0 {
+                ui.label(
+                    egui::RichText::new("Larger than the original")
+                        .strong()
+                        .color(warn_text()),
+                );
+            }
+        }
+        if stale_result {
+            ui.label(
+                egui::RichText::new("This comparison used the previous settings.").color(warn_text()),
+            );
+        }
+        ui.add_space(8.0);
         let col = (ui.available_width() / 2.0 - 8.0).max(80.0);
         let before = self.before_tex.clone();
         let after = self.after_tex.clone();
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(col);
+                ui.label(egui::RichText::new("Before").strong());
                 let caption = match original_bytes {
-                    Some(bytes) => format!("Original · {}", model::format_bytes(bytes)),
+                    Some(bytes) => model::format_bytes(bytes),
                     None => "Original".to_string(),
                 };
-                ui.label(caption);
+                ui.label(egui::RichText::new(caption).color(muted_text()));
                 if let Some(tex) = &before {
                     show_preview_image(ui, tex, col);
                 } else {
@@ -994,7 +1329,13 @@ impl OptimizerApp {
             });
             ui.vertical(|ui| {
                 ui.set_width(col);
-                ui.label(&after_caption);
+                ui.label(egui::RichText::new("After").strong());
+                let after_line = if after_caption == "Output" {
+                    "Not yet".to_string()
+                } else {
+                    after_caption.clone()
+                };
+                ui.label(egui::RichText::new(after_line).color(muted_text()));
                 if let Some(tex) = &after {
                     show_preview_image(ui, tex, col);
                 } else if output.is_some() {
@@ -1002,20 +1343,31 @@ impl OptimizerApp {
                 } else if self.running {
                     ui.label("Working…");
                 } else if after_caption == "Output" {
-                    ui.label("Optimize to compare.");
+                    ui.label("Press Optimize to compare.");
                 } else if !matches!(
                     after_caption.as_str(),
                     "Already small enough" | "Kept original" | "Skipped" | "Skip"
                 ) {
-                    ui.label("No output file.");
+                    ui.label("No copy was written.");
                 }
             });
         });
         if let Some(summary) = summary {
-            ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(summary).wrap_mode(egui::TextWrapMode::Wrap),
-            );
+            ui.add_space(6.0);
+            hint(ui, "Compared");
+            ui.add(egui::Label::new(summary).wrap_mode(egui::TextWrapMode::Wrap));
+        }
+        self.remove_button(ui, index);
+    }
+
+    fn remove_button(&mut self, ui: &mut egui::Ui, index: usize) {
+        ui.add_space(8.0);
+        if ui
+            .add_enabled(!self.running, egui::Button::new("Remove from list"))
+            .on_hover_text("Takes this file off the list. Does not delete it.")
+            .clicked()
+        {
+            self.remove_row(index);
         }
     }
 }
@@ -1027,16 +1379,40 @@ impl eframe::App for OptimizerApp {
         if let Ok(json) = serde_json::to_string(&self.settings) {
             storage.set_string("settings", json);
         }
+        storage.set_string(
+            "advanced",
+            if self.advanced { "1" } else { "0" }.to_string(),
+        );
+        storage.set_string(
+            "coach",
+            if self.coach_dismissed { "1" } else { "0" }.to_string(),
+        );
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
         self.intake_drops(ctx);
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                self.ui(ui, ctx);
+        egui::TopBottomPanel::bottom("action_bar")
+            .frame(
+                egui::Frame::NONE
+                    .fill(card_fill())
+                    .stroke(egui::Stroke::new(1.0_f32, card_stroke()))
+                    .inner_margin(egui::Margin::symmetric(16, 12)),
+            )
+            .show(ctx, |ui| {
+                self.action_bar(ui);
             });
-        });
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::NONE
+                    .fill(page_fill())
+                    .inner_margin(egui::Margin::same(16)),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.ui(ui, ctx);
+                });
+            });
         self.show_picker(ctx);
     }
 }
@@ -1115,7 +1491,11 @@ impl OptimizerApp {
                     self.add_path(path);
                 }
                 let added = self.rows.len() - count_before;
-                self.log = format!("Added {added} image(s).");
+                self.log = if added == 0 {
+                    "Those images are already in the list.".to_string()
+                } else {
+                    format!("Added {}.", plural(added, "image", "images"))
+                };
             }
             PickerOutcome::Output(path) => {
                 self.log = format!("Output folder: {}", path.display());
@@ -1139,9 +1519,13 @@ enum NativeResult {
 }
 
 fn picker_ui(ui: &mut egui::Ui, picker: &mut DirPicker) -> PickerOutcome {
-    ui.label(picker.current.display().to_string());
+    ui.label(
+        egui::RichText::new(picker.current.display().to_string())
+            .size(13.0)
+            .color(muted_text()),
+    );
     ui.horizontal_wrapped(|ui| {
-        if ui.button("Up").clicked() {
+        if ui.button("Up one folder").clicked() {
             if let Some(parent) = files::parent_dir(&picker.current) {
                 picker.enter(parent);
             }
@@ -1153,7 +1537,17 @@ fn picker_ui(ui: &mut egui::Ui, picker: &mut DirPicker) -> PickerOutcome {
         }
     });
     if !picker.error.is_empty() {
-        ui.colored_label(egui::Color32::RED, &picker.error);
+        ui.colored_label(egui::Color32::from_rgb(153, 27, 27), &picker.error);
+    }
+    let images = picker.entries.iter().filter(|item| !item.is_dir).count();
+    let folders = picker.entries.iter().filter(|item| item.is_dir).count();
+    if picker.error.is_empty() {
+        hint(
+            ui,
+            &format!(
+                "{images} images · {folders} folders. Click a folder to open it. Click a file to select it."
+            ),
+        );
     }
     let mut enter: Option<PathBuf> = None;
     let mut toggle: Option<PathBuf> = None;
@@ -1161,7 +1555,7 @@ fn picker_ui(ui: &mut egui::Ui, picker: &mut DirPicker) -> PickerOutcome {
         .max_height(320.0)
         .show(ui, |ui| {
             if picker.entries.is_empty() && picker.error.is_empty() {
-                ui.label("No images in this folder.");
+                ui.label("This folder is empty.");
             }
             for item in &picker.entries {
                 let label = if item.is_dir {
@@ -1189,31 +1583,42 @@ fn picker_ui(ui: &mut egui::Ui, picker: &mut DirPicker) -> PickerOutcome {
             picker.selected.push(path);
         }
     }
-    ui.separator();
+    ui.add_space(8.0);
     let mut outcome = PickerOutcome::Stay;
-    ui.horizontal(|ui| {
-        match picker.purpose {
-            PickerPurpose::Images => {
-                if ui.button("Add images in this folder").clicked() {
-                    outcome = PickerOutcome::Add(vec![picker.current.clone()]);
-                }
-                if ui
-                    .add_enabled(!picker.selected.is_empty(), egui::Button::new("Add selected"))
-                    .clicked()
-                {
-                    outcome = PickerOutcome::Add(picker.selected.clone());
-                }
+    match picker.purpose {
+        PickerPurpose::Images => {
+            let selected = picker.selected.len();
+            if selected > 0 {
+                ui.label(format!("{selected} selected"));
             }
-            PickerPurpose::Output => {
-                if ui.button("Use this folder").clicked() {
-                    outcome = PickerOutcome::Output(picker.current.clone());
-                }
+            if primary_button(ui, "Add images in this folder").clicked() {
+                outcome = PickerOutcome::Add(vec![picker.current.clone()]);
+            }
+            ui.add_space(4.0);
+            if ui
+                .add_enabled(
+                    !picker.selected.is_empty(),
+                    egui::Button::new("Add selected only").min_size(egui::vec2(240.0, 36.0)),
+                )
+                .clicked()
+            {
+                outcome = PickerOutcome::Add(picker.selected.clone());
             }
         }
-        if ui.button("Close").clicked() {
-            outcome = PickerOutcome::Close;
+        PickerPurpose::Output => {
+            hint(
+                ui,
+                "Results go here. A file already in this folder with the same name is replaced. Originals are never replaced.",
+            );
+            if primary_button(ui, "Use this folder").clicked() {
+                outcome = PickerOutcome::Output(picker.current.clone());
+            }
         }
-    });
+    }
+    ui.add_space(4.0);
+    if ui.button("Close").clicked() {
+        outcome = PickerOutcome::Close;
+    }
     outcome
 }
 
@@ -1228,20 +1633,42 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 fn step_title(kind: StepKind, files: usize) -> String {
     match kind {
         StepKind::NeedTools => "The optimizer did not start".to_string(),
-        StepKind::Add => "Add the images you want to shrink".to_string(),
+        StepKind::Add => "Drop your images here".to_string(),
         StepKind::Optimize => format!("Ready to shrink {}", plural(files, "image", "images")),
         StepKind::Working => "Optimizing your images".to_string(),
         StepKind::Open => "Your images are ready".to_string(),
     }
 }
 
+fn step_kicker(kind: StepKind, wrote: bool) -> &'static str {
+    match kind {
+        StepKind::NeedTools => "Setup",
+        StepKind::Add => "Start here",
+        StepKind::Optimize => "Ready when you are",
+        StepKind::Working => "In progress",
+        StepKind::Open if wrote => "All done",
+        StepKind::Open => "Nothing new",
+    }
+}
+
 fn step_detail(kind: StepKind) -> &'static str {
     match kind {
         StepKind::NeedTools => "This copy of the app is missing its tools.",
-        StepKind::Add => "JPEG, PNG, or WebP. Drop a folder here, or use the button.",
-        StepKind::Optimize => "Format buttons under the list override one file.",
-        StepKind::Working => "",
+        StepKind::Add => "JPEG, PNG, or WebP. Drop a file or a folder here, or use the button below.",
+        StepKind::Optimize => "Originals stay where they are. A copy is written only when it is smaller.",
+        StepKind::Working => "You can cancel. Files already finished are kept.",
         StepKind::Open => "",
+    }
+}
+
+fn action_label(kind: StepKind, wrote: bool, all_skipped: bool) -> &'static str {
+    let try_web = matches!(kind, StepKind::Open) && !wrote && !all_skipped;
+    if try_web {
+        "Shrink for the web"
+    } else if matches!(kind, StepKind::Open) && !wrote {
+        ""
+    } else {
+        step_action(kind)
     }
 }
 
@@ -1272,6 +1699,14 @@ fn warn_text() -> egui::Color32 {
     egui::Color32::from_rgb(154, 52, 18)
 }
 
+fn good_text() -> egui::Color32 {
+    egui::Color32::from_rgb(21, 128, 61)
+}
+
+fn muted_text() -> egui::Color32 {
+    egui::Color32::from_rgb(71, 85, 105)
+}
+
 fn accent() -> egui::Color32 {
     // Dark enough that white button text clears 4.5:1.
     egui::Color32::from_rgb(194, 65, 12)
@@ -1298,14 +1733,32 @@ fn page_fill() -> egui::Color32 {
 }
 
 fn apply_theme(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    style.spacing.interact_size.y = 32.0;
+    style.spacing.slider_rail_height = 10.0;
+    // The default bar is invisible until the pointer is over the list.
+    let mut scroll = egui::style::ScrollStyle::solid();
+    scroll.bar_width = 12.0;
+    scroll.handle_min_length = 36.0;
+    scroll.bar_inner_margin = 6.0;
+    scroll.bar_outer_margin = 2.0;
+    scroll.foreground_color = true;
+    style.spacing.scroll = scroll;
+    ctx.set_style(style);
+
+    let track = egui::Color32::from_rgb(203, 213, 225);
     let mut visuals = egui::Visuals::light();
     visuals.window_fill = page_fill();
     visuals.panel_fill = page_fill();
     visuals.faint_bg_color = egui::Color32::from_rgb(226, 232, 240);
-    visuals.extreme_bg_color = card_fill();
+    // Scrollbar track and text fields. White here disappears on the cards.
+    visuals.extreme_bg_color = track;
     visuals.code_bg_color = egui::Color32::from_rgb(226, 232, 240);
     visuals.hyperlink_color = egui::Color32::from_rgb(29, 78, 216);
-    visuals.selection.bg_fill = egui::Color32::from_rgb(219, 234, 254);
+    visuals.selection.bg_fill = egui::Color32::from_rgb(147, 197, 253);
+    visuals.slider_trailing_fill = true;
     visuals.override_text_color = Some(ink_text());
     visuals.window_stroke = egui::Stroke::new(1.0_f32, card_stroke());
     for widget in [
@@ -1319,10 +1772,20 @@ fn apply_theme(ctx: &egui::Context) {
         widget.bg_stroke.color = card_stroke();
     }
     visuals.widgets.noninteractive.bg_fill = page_fill();
-    visuals.widgets.inactive.bg_fill = card_fill();
+    // Strong labels use the active text color. Keep it dark so section titles
+    // stay visible. Buttons that sit on the accent color set their own white text.
+    // Slider rails use this same fill. White on a white card hides the rail.
+    visuals.widgets.inactive.bg_fill = track;
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(2.0, ink_text());
+    // The light theme's idle checkbox stroke has width 0. A white fill on a
+    // white card then disappears until the box is checked.
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.5, muted_text());
     visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(226, 232, 240);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.5, ink_text());
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(2.0, ink_text());
     visuals.widgets.active.bg_fill = accent();
-    visuals.widgets.active.fg_stroke.color = egui::Color32::WHITE;
+    // Do not paint this white. Strong labels take their color from here.
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(2.0, ink_text());
     visuals.widgets.open.bg_fill = egui::Color32::from_rgb(226, 232, 240);
     ctx.set_visuals(visuals);
 }
@@ -1462,12 +1925,267 @@ fn shared_choice(rows: &[FileRow], indexes: &[usize]) -> Option<RowChoice> {
     }
 }
 
-fn option_group(ui: &mut egui::Ui, title: &str, first: bool) {
-    if !first {
-        ui.add_space(6.0);
-        ui.separator();
+fn stored_flag(storage: Option<&dyn eframe::Storage>, key: &str) -> bool {
+    storage
+        .and_then(|storage| storage.get_string(key))
+        .as_deref()
+        == Some("1")
+}
+
+fn mode_switch(ui: &mut egui::Ui, advanced: &mut bool) -> bool {
+    let before = *advanced;
+    // Fixed width so this pair stays Simple, then Advanced, and does not push Licenses off.
+    ui.allocate_ui_with_layout(
+        egui::vec2(196.0, 32.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if mode_button(ui, "Simple", !*advanced)
+                .on_hover_text("A few clear choices. Extra controls stay hidden.")
+                .clicked()
+            {
+                *advanced = false;
+            }
+            if mode_button(ui, "Advanced", *advanced)
+                .on_hover_text("Quality, size, output folder, and per-file format.")
+                .clicked()
+            {
+                *advanced = true;
+            }
+        },
+    );
+    *advanced != before
+}
+
+fn mode_button(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
+    let mut text = egui::RichText::new(label).size(14.0);
+    if on {
+        text = text.strong().color(egui::Color32::WHITE);
     }
-    ui.strong(title);
+    let mut button = egui::Button::new(text).min_size(egui::vec2(96.0, 32.0));
+    if on {
+        button = button.fill(accent());
+    }
+    ui.add(button)
+}
+
+fn visible_presets(advanced: bool, current: Preset) -> Vec<Preset> {
+    if advanced || current == Preset::Custom {
+        Preset::ALL.to_vec()
+    } else {
+        vec![Preset::Web, Preset::Compress, Preset::Lossless]
+    }
+}
+
+fn preset_plain(preset: Preset) -> (&'static str, &'static str) {
+    match preset {
+        Preset::Web => (
+            "For the web",
+            "Shrinks the long side to 1600 px for sites and email.",
+        ),
+        Preset::Compress => (
+            "Smaller file",
+            "Keeps the full size and uses a lighter save.",
+        ),
+        Preset::Lossless => (
+            "Perfect quality",
+            "Looks identical. The file gets a little smaller.",
+        ),
+        Preset::Custom => ("Your settings", "Uses the quality and size you set."),
+    }
+}
+
+fn preset_card(ui: &mut egui::Ui, preset: Preset, selected: bool, show_badge: bool) -> egui::Response {
+    let (title, detail) = preset_plain(preset);
+    let width = ui.available_width();
+    let height = if show_badge { 138.0 } else { 112.0 };
+    let fill = if selected {
+        egui::Color32::from_rgb(255, 247, 237)
+    } else {
+        card_fill()
+    };
+    let response = ui.add(
+        egui::Button::new("")
+            .min_size(egui::vec2(width, height))
+            .fill(fill)
+            .stroke(egui::Stroke::new(
+                if selected { 2.0_f32 } else { 1.0_f32 },
+                if selected { accent() } else { card_stroke() },
+            ))
+            .corner_radius(egui::CornerRadius::same(10)),
+    );
+    if ui.is_enabled() {
+        response.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
+    let rect = response.rect.shrink2(egui::vec2(12.0, 10.0));
+    let painter = ui.painter_at(rect);
+    let title_color = if selected { accent() } else { ink_text() };
+    let mut y = rect.top();
+    let title_galley = painter.layout_no_wrap(
+        title.to_string(),
+        egui::FontId::proportional(16.0),
+        title_color,
+    );
+    let title_h = title_galley.size().y;
+    painter.galley(egui::pos2(rect.left(), y), title_galley, title_color);
+    y += title_h + 2.0;
+    if show_badge {
+        let badge = painter.layout_no_wrap(
+            preset.label().to_string(),
+            egui::FontId::proportional(12.0),
+            muted_text(),
+        );
+        let badge_h = badge.size().y;
+        painter.galley(egui::pos2(rect.left(), y), badge, muted_text());
+        y += badge_h + 4.0;
+    } else {
+        y += 4.0;
+    }
+    let detail_galley = painter.layout(
+        detail.to_string(),
+        egui::FontId::proportional(13.0),
+        body_text(),
+        rect.width(),
+    );
+    painter.galley(egui::pos2(rect.left(), y), detail_galley, body_text());
+    if selected {
+        let mark = painter.layout_no_wrap(
+            "In use".to_string(),
+            egui::FontId::proportional(12.0),
+            accent(),
+        );
+        let mark_y = rect.bottom() - mark.size().y;
+        painter.galley(egui::pos2(rect.left(), mark_y), mark, accent());
+    }
+    response.on_hover_text(preset.detail())
+}
+
+fn panel_frame() -> egui::Frame {
+    egui::Frame::NONE
+        .fill(card_fill())
+        .stroke(egui::Stroke::new(1.0_f32, card_stroke()))
+        .inner_margin(egui::Margin::same(12))
+        .corner_radius(egui::CornerRadius::same(10))
+}
+
+fn group_card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(8.0);
+    egui::Frame::NONE
+        .fill(card_fill())
+        .stroke(egui::Stroke::new(1.0_f32, card_stroke()))
+        .inner_margin(egui::Margin::same(12))
+        .corner_radius(egui::CornerRadius::same(10))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(title)
+                    .strong()
+                    .size(16.0)
+                    .color(ink_text()),
+            );
+            ui.add_space(6.0);
+            add(ui);
+        });
+}
+
+fn hint(ui: &mut egui::Ui, text: &str) {
+    ui.add(
+        egui::Label::new(egui::RichText::new(text).size(13.0).color(muted_text()))
+            .wrap_mode(egui::TextWrapMode::Wrap),
+    );
+}
+
+fn quality_hint(quality: u8) -> &'static str {
+    match quality {
+        0..=50 => "Small files, visible softness.",
+        51..=75 => "Smaller files, slight softness.",
+        76..=90 => "A good balance for photos.",
+        91..=95 => "Very sharp, and the files stay large.",
+        _ => "Almost identical to the original.",
+    }
+}
+
+fn choice_tip(choice: RowChoice) -> &'static str {
+    match choice {
+        RowChoice::Recommended => "Compare JPEG, PNG, and WebP, then keep the smaller good one.",
+        RowChoice::Jpeg => "Always write a JPEG.",
+        RowChoice::Png => "Always write a PNG.",
+        RowChoice::Webp => "Always write a WebP.",
+        RowChoice::Skip => "Leave this file out. Nothing is written.",
+    }
+}
+
+fn result_label(row: &FileRow, webp_lossless: bool, advanced: bool) -> String {
+    if row.info.is_err() {
+        return row.status.clone();
+    }
+    if !advanced {
+        match row.status.as_str() {
+            "Ready" | "" if row.output_bytes.is_none() => {
+                return match row.choice {
+                    RowChoice::Recommended => "Ready".to_string(),
+                    RowChoice::Skip => "Will skip".to_string(),
+                    RowChoice::Jpeg => "Will save as JPEG".to_string(),
+                    RowChoice::Png => "Will save as PNG".to_string(),
+                    RowChoice::Webp => "Will save as WebP".to_string(),
+                };
+            }
+            "Queued" => return "Waiting…".to_string(),
+            "Working" => return "Working…".to_string(),
+            "Kept original" => return "Kept the original".to_string(),
+            "Skipped" => return "Skipped".to_string(),
+            "Already small enough" => return "Already small enough".to_string(),
+            _ => {}
+        }
+    }
+    row_result(row, webp_lossless)
+}
+
+fn result_color(row: &FileRow) -> egui::Color32 {
+    if row.info.is_err() {
+        return egui::Color32::from_rgb(153, 27, 27);
+    }
+    if row.choice == RowChoice::Skip {
+        return muted_text();
+    }
+    if let (Ok(info), Some(output)) = (&row.info, row.output_bytes) {
+        if output < info.bytes {
+            return good_text();
+        }
+        return body_text();
+    }
+    match row.status.as_str() {
+        "Working" | "Queued" => accent(),
+        "Already small enough" | "Kept original" | "Skipped" | "Ready" | "" => {
+            if row.choice == RowChoice::Skip {
+                muted_text()
+            } else {
+                body_text()
+            }
+        }
+        _ => {
+            if row.status.starts_with("Done") || row.output_bytes.is_some() {
+                good_text()
+            } else {
+                egui::Color32::from_rgb(153, 27, 27)
+            }
+        }
+    }
+}
+
+fn log_color(log: &str) -> egui::Color32 {
+    let lower = log.to_ascii_lowercase();
+    if lower.starts_with("stopped at") {
+        warn_text()
+    } else if lower.starts_with("added")
+        || lower.starts_with("output folder")
+        || lower.starts_with("stopped")
+        || lower.starts_with("those images")
+    {
+        body_text()
+    } else {
+        egui::Color32::from_rgb(153, 27, 27)
+    }
 }
 
 fn wrapped_label(ui: &mut egui::Ui, text: &str, size: f32, color: egui::Color32) {
@@ -1479,7 +2197,7 @@ fn wrapped_label(ui: &mut egui::Ui, text: &str, size: f32, color: egui::Color32)
 
 fn show_preview_image(ui: &mut egui::Ui, tex: &egui::TextureHandle, max_width: f32) {
     let size = tex.size_vec2();
-    let max = max_width.min(340.0);
+    let max = max_width.min(420.0);
     let scale = if size.x > max && size.x > 0.0 {
         max / size.x
     } else {
@@ -1704,6 +2422,14 @@ mod tests {
         assert_eq!(step_action(StepKind::Optimize), "Optimize");
         assert_eq!(step_title(StepKind::Optimize, 3), "Ready to shrink 3 images");
         assert_eq!(step_title(StepKind::Optimize, 1), "Ready to shrink 1 image");
+        assert_eq!(step_title(StepKind::Add, 0), "Drop your images here");
+        assert_eq!(step_kicker(StepKind::Add, false), "Start here");
+        assert_eq!(step_kicker(StepKind::Open, true), "All done");
+        assert_eq!(step_kicker(StepKind::Open, false), "Nothing new");
+        assert_eq!(action_label(StepKind::Add, false, false), "Add images");
+        assert_eq!(action_label(StepKind::Open, true, false), "Open folder");
+        assert_eq!(action_label(StepKind::Open, false, false), "Shrink for the web");
+        assert_eq!(action_label(StepKind::Open, false, true), "");
 
         assert_eq!(step_kind(true, 3, 1, true), StepKind::Working);
         assert_eq!(step_action(StepKind::Working), "Cancel");
@@ -1809,5 +2535,45 @@ mod tests {
         assert_eq!(finished_title(false, true, 2), "Nothing new to write");
         assert_eq!(progress_text("a.jpg", 1, 4), "a.jpg · 1 of 4");
         assert_eq!(progress_text("", 0, 4), "0 of 4");
+    }
+
+    #[test]
+    fn simple_mode_hides_custom_until_the_settings_leave_a_style() {
+        assert_eq!(
+            visible_presets(false, Preset::Compress),
+            vec![Preset::Web, Preset::Compress, Preset::Lossless]
+        );
+        assert_eq!(visible_presets(false, Preset::Custom), Preset::ALL.to_vec());
+        assert_eq!(visible_presets(true, Preset::Web), Preset::ALL.to_vec());
+    }
+
+    #[test]
+    fn simple_results_avoid_format_jargon_before_a_run() {
+        let ready = sample_row("Ready", false, RowChoice::Recommended);
+        assert_eq!(result_label(&ready, false, false), "Ready");
+        assert_eq!(result_label(&ready, false, true), "Best");
+        assert_eq!(
+            result_label(
+                &sample_row("Queued", false, RowChoice::Recommended),
+                false,
+                false
+            ),
+            "Waiting…"
+        );
+        assert_eq!(
+            result_label(&sample_row("Working", false, RowChoice::Jpeg), false, false),
+            "Working…"
+        );
+        assert_eq!(
+            result_label(&sample_row("Ready", false, RowChoice::Skip), false, false),
+            "Will skip"
+        );
+    }
+
+    #[test]
+    fn quality_hints_follow_the_slider() {
+        assert_eq!(quality_hint(40), "Small files, visible softness.");
+        assert_eq!(quality_hint(90), "A good balance for photos.");
+        assert_eq!(quality_hint(100), "Almost identical to the original.");
     }
 }

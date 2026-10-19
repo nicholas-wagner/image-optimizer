@@ -32,7 +32,7 @@ impl Preset {
             Self::Web => "Shrink the long side to 1600 px, then pick the smaller format.",
             Self::Compress => "Keep the full size. JPEG max quality 90.",
             Self::Lossless => "No quality loss. Best still picks JPEG, PNG, or WebP.",
-            Self::Custom => "The sliders under Options.",
+            Self::Custom => "The controls under Advanced options.",
         }
     }
 
