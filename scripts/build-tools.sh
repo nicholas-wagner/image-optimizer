@@ -131,25 +131,7 @@ if [ ! -d "$third/pngcrush-src/pngcrush-1.8.13-nolib" ]; then
   tar -xJf "$third/pngcrush-1.8.13.orig.tar.xz" -C "$third/pngcrush-src"
 fi
 src="$third/pngcrush-src/pngcrush-1.8.13-nolib/pngcrush.c"
-if ! grep -q "Removed from libpng 1.6.32" "$src"; then
-  python3 - "$src" <<'PY'
-import pathlib, sys
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-old = """                    png_set_option(read_ptr, PNG_IGNORE_ADLER32,
-                        PNG_OPTION_ON);
-"""
-new = """#ifdef PNG_IGNORE_ADLER32
-                    /* Removed from libpng 1.6.32+. Skip when the option is absent. */
-                    png_set_option(read_ptr, PNG_IGNORE_ADLER32,
-                        PNG_OPTION_ON);
-#endif
-"""
-if old not in text:
-    raise SystemExit("pngcrush.c patch context not found")
-path.write_text(text.replace(old, new, 1))
-PY
-fi
+python3 "$root/scripts/patch-pngcrush.py" "$src"
 (
   cd "$third/pngcrush-src/pngcrush-1.8.13-nolib"
   # Drop the old object so a new zlib include path is actually compiled in.

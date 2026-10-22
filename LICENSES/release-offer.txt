@@ -1,0 +1,10 @@
+This download is one file. jpegoptim inside it is GPL-3.0-or-later and runs as a separate program.
+
+Corresponding source for that jpegoptim binary:
+- jpegoptim 1.5.6: https://github.com/tjko/jpegoptim/archive/refs/tags/v1.5.6.tar.gz
+- libjpeg-turbo 3.0.4, statically linked, SIMD off: https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.0.4/libjpeg-turbo-3.0.4.tar.gz
+- Build scripts: https://github.com/nicholas-wagner/image-optimizer/tree/RELEASE_TAG
+
+This software is based in part on the work of the Independent JPEG Group.
+
+pngcrush 1.8.13 is modified: PNG_IGNORE_ADLER32 is compiled only when libpng defines it. cwebp is the unmodified libwebp 1.6.0 binary. Full license texts are in the app under Licenses.

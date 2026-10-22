@@ -1,0 +1,64 @@
+Image Optimizer
+Copyright (c) 2026 Nick Wagner
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+This download is one file. Release builds store jpegoptim, pngcrush, and cwebp inside that file and unpack them before running them. The GUI does not link those programs. It starts each one as its own process.
+
+jpegoptim 1.5.6
+Copyright (C) 1996-2022 Timo Kokkonen
+SPDX-License-Identifier: GPL-3.0-or-later
+
+jpegoptim is free software under the GNU General Public License, version 3 or any later version. The license text follows this notice.
+
+This copy is built from
+https://github.com/tjko/jpegoptim/archive/refs/tags/v1.5.6.tar.gz
+and is statically linked with libjpeg-turbo 3.0.4, SIMD off, from
+https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.0.4/libjpeg-turbo-3.0.4.tar.gz
+The build commands are scripts/build-tools.sh on Linux and scripts/build-windows-inner.sh on Windows, in
+https://github.com/nicholas-wagner/image-optimizer
+at the same version tag as this app.
+
+This software is based in part on the work of the Independent JPEG Group.
+
+pngcrush 1.8.13
+Copyright (C) 1998-2017 Glenn Randers-Pehrson
+Portions Copyright (C) 2005 Greg Roelofs
+
+Image Optimizer change: the PNG_IGNORE_ADLER32 call is wrapped in #ifdef PNG_IGNORE_ADLER32 because libpng 1.6.32 removed that option. This is not the original pngcrush 1.8.13 source. The original notice follows this summary.
+
+pngcrush is built against libpng 1.6.44
+https://github.com/pnggroup/libpng/archive/refs/tags/v1.6.44.tar.gz
+and zlib 1.3.1
+https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz
+On Linux, a system static zlib is used when one is installed. Those licenses ask for an acknowledgment in product documentation and do not require one.
+
+cwebp from libwebp 1.6.0
+Copyright (c) 2010, Google Inc. All rights reserved.
+
+This is the unmodified official binary.
+Linux: https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0-linux-x86-64.tar.gz
+Windows: https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0-windows-x64.zip
+The BSD license and the additional patent grant follow this summary.
+
+On Linux, if libxkbcommon-x11.so.0 or libxcb-xkb.so.1 is missing, this app unpacks copies of those libraries and loads them into the GUI process. Their notices follow this summary.
+libxkbcommon: https://xkbcommon.org/
+libxcb-xkb: Copyright (C) 2001-2006 Bart Massey, Jamey Sharp, and Josh Triplett.

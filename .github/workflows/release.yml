@@ -72,6 +72,8 @@ jobs:
         run: |
           ls -l dist
           tag="${GITHUB_REF_NAME}"
+          notes=$(mktemp)
+          sed "s/RELEASE_TAG/${tag}/g" LICENSES/release-offer.txt > "$notes"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" --clobber \
               dist/image-optimizer-linux-x86_64 \
@@ -80,6 +82,7 @@ jobs:
             gh release create "$tag" \
               --title "$tag" \
               --generate-notes \
+              --notes "$(cat "$notes")" \
               dist/image-optimizer-linux-x86_64 \
               dist/image-optimizer-windows-x86_64.exe
           fi

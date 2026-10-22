@@ -729,9 +729,10 @@ impl OptimizerApp {
         if self.show_licenses {
             egui::Window::new("Licenses")
                 .open(&mut self.show_licenses)
-                .default_width(520.0)
+                .default_width(640.0)
+                .default_height(520.0)
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
                         ui.label(crate::licenses::TEXT);
                     });
                 });

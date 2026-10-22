@@ -55,4 +55,8 @@ Windows, about 15 minutes, needs Docker:
 
 ## Licenses
 
-The GUI is MIT. jpegoptim is GPL-3 and is run as a separate program. pngcrush, libpng, zlib, libjpeg-turbo, and libwebp have their own notices. Open Licenses in the app.
+The download is one file. The GUI is MIT. jpegoptim, pngcrush, and cwebp are stored inside that file and run as separate programs.
+
+jpegoptim is GPL-3.0-or-later. Its corresponding source is jpegoptim 1.5.6 and libjpeg-turbo 3.0.4, built by the scripts in this repository. This software is based in part on the work of the Independent JPEG Group.
+
+pngcrush 1.8.13 is modified: the Adler32 option is compiled only when libpng still provides it. cwebp is the unmodified libwebp 1.6.0 binary. Linux may also unpack libxkbcommon-x11 and libxcb-xkb. Open Licenses in the app for the full texts.
