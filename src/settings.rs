@@ -30,7 +30,9 @@ impl Preset {
     pub fn detail(self) -> &'static str {
         match self {
             Self::Web => "Shrink the long side to 1600 px, then pick the smaller format.",
-            Self::Compress => "Keep the full size. JPEG max quality 90.",
+            Self::Compress => {
+                "Photos and large images save as JPEG quality 90, 4:2:0. Small art stays PNG. WebP is used when it is at least 8% smaller."
+            }
             Self::Lossless => "No quality loss. Best still picks JPEG, PNG, or WebP.",
             Self::Custom => "The controls under Advanced options.",
         }

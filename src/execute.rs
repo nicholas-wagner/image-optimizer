@@ -106,6 +106,8 @@ pub fn recommend_file(
         info.format,
         has_alpha,
         color_count,
+        info.width,
+        info.height,
         settings.webp_lossless,
     );
     let scratch = Scratch::new("recommend")?;
@@ -137,6 +139,30 @@ pub fn optimize_file(
     cancel: &CancelFlag,
 ) -> Result<OptimizeOutcome, String> {
     encode_one(tools, settings, src, info, encode, output_dir, cancel)
+}
+
+/// Encode WebP in a temp directory and return its size. The file is deleted.
+pub fn measure_webp(
+    tools: &ToolPaths,
+    settings: &Settings,
+    src: &Path,
+    info: &ImageInfo,
+    mode: WebpMode,
+    cancel: &CancelFlag,
+) -> Result<u64, String> {
+    let scratch = Scratch::new("webp-hint")?;
+    let out_dir = scratch.path.join("webp");
+    fs::create_dir_all(&out_dir).map_err(|err| err.to_string())?;
+    let outcome = encode_one(
+        tools,
+        settings,
+        src,
+        info,
+        Encode::Webp(mode),
+        &out_dir,
+        cancel,
+    )?;
+    Ok(outcome.output_bytes)
 }
 
 fn encode_one(
@@ -304,25 +330,17 @@ pub fn effective_encode(
         RowChoice::Skip => Ok(None),
         RowChoice::Jpeg => Ok(Some(Encode::Jpeg)),
         RowChoice::Png => Ok(Some(Encode::Png)),
-        RowChoice::Webp => {
-            let mode = if has_alpha || webp_lossless {
-                WebpMode::Lossless
-            } else {
-                WebpMode::Lossy
-            };
-            Ok(Some(Encode::Webp(mode)))
-        }
+        RowChoice::Webp => Ok(Some(Encode::Webp(model::webp_chip_mode(
+            has_alpha,
+            webp_lossless,
+        )))),
         RowChoice::Recommended => match recommendation.map(|rec| rec.decision) {
             Some(Decision::Keep) => Ok(None),
             Some(Decision::Use(encode)) => Ok(Some(encode)),
             None => Ok(Some(match format {
                 SourceFormat::Jpeg => Encode::Jpeg,
                 SourceFormat::Png => Encode::Png,
-                SourceFormat::Webp => Encode::Webp(if has_alpha || webp_lossless {
-                    WebpMode::Lossless
-                } else {
-                    WebpMode::Lossy
-                }),
+                SourceFormat::Webp => Encode::Webp(model::webp_chip_mode(has_alpha, webp_lossless)),
             })),
         },
     }
@@ -480,6 +498,71 @@ mod tests {
         ToolPaths::from_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin")).ok()
     }
 
+    fn jpeg_sampling(path: &Path) -> Vec<(u8, u8)> {
+        let bytes = fs::read(path).unwrap();
+        let mut i = 0;
+        while i + 4 < bytes.len() {
+            if bytes[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = bytes[i + 1];
+            // SOI, EOI, and restart markers have no length field.
+            if marker == 0x00
+                || marker == 0x01
+                || marker == 0xD8
+                || marker == 0xD9
+                || (0xD0..=0xD7).contains(&marker)
+            {
+                i += 2;
+                continue;
+            }
+            if marker == 0xDA {
+                break;
+            }
+            let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+            if marker == 0xC0 || marker == 0xC2 {
+                let count = bytes[i + 9] as usize;
+                let mut samples = Vec::new();
+                let mut at = i + 10;
+                for _ in 0..count {
+                    let factor = bytes[at + 1];
+                    samples.push((factor >> 4, factor & 0x0F));
+                    at += 3;
+                }
+                return samples;
+            }
+            i += 2 + len;
+        }
+        panic!("JPEG has no SOF marker");
+    }
+
+    #[test]
+    fn lossy_jpeg_uses_420_sampling() {
+        let Some(tools) = tools() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("io-420-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("photo.jpg");
+        write_jpeg_fixture(&src, 95);
+        let info = analyze::analyze(&src).unwrap();
+        let out = dir.join("optimized");
+        let outcome = optimize_file(
+            &tools,
+            &Settings::default(),
+            &src,
+            &info,
+            Encode::Jpeg,
+            &out,
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert_eq!(jpeg_sampling(&outcome.output_path), vec![(2, 2), (1, 1), (1, 1)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn jpeg_optimize_does_not_change_the_source() {
         let Some(tools) = tools() else {
@@ -510,6 +593,39 @@ mod tests {
             "{:?}",
             outcome.commands
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn measure_webp_leaves_the_source_and_drops_the_temp_file() {
+        let Some(tools) = tools() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("io-measure-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("photo.jpg");
+        write_jpeg_fixture(&src, 95);
+        let before = fs::read(&src).unwrap();
+        let info = analyze::analyze(&src).unwrap();
+        let bytes = measure_webp(
+            &tools,
+            &Settings::default(),
+            &src,
+            &info,
+            WebpMode::Lossy,
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert!(bytes > 0);
+        assert_eq!(fs::read(&src).unwrap(), before);
+        assert!(dir.read_dir().unwrap().all(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_none_or(|ext| ext != "webp")
+        }));
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 pub const MIN_SAVINGS: f64 = 0.03;
 pub const WEBP_BEAT_BY: f64 = 0.08;
+/// Opaque art at least this long on one side is saved as JPEG, same as a photo.
+pub const LARGE_EDGE: u32 = 1200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceFormat {
@@ -138,6 +140,20 @@ impl Recommendation {
 
 /// Photos are JPEGs, and PNG/WebP images with no alpha and more than 256 colors.
 /// A missing color count is treated as a photo so a large PNG is not pngcrushed.
+/// Opaque images whose long side is at least [`LARGE_EDGE`] also save as JPEG.
+pub fn saves_as_jpeg(
+    format: SourceFormat,
+    has_alpha: bool,
+    color_count: Option<u32>,
+    width: u32,
+    height: u32,
+) -> bool {
+    if has_alpha {
+        return false;
+    }
+    is_photo(format, false, color_count) || width.max(height) >= LARGE_EDGE
+}
+
 pub fn is_photo(format: SourceFormat, has_alpha: bool, color_count: Option<u32>) -> bool {
     if has_alpha {
         return false;
@@ -148,16 +164,27 @@ pub fn is_photo(format: SourceFormat, has_alpha: bool, color_count: Option<u32>)
     }
 }
 
+/// The WebP a format chip writes. Transparency and the lossless switch stay exact.
+pub fn webp_chip_mode(has_alpha: bool, webp_lossless: bool) -> WebpMode {
+    if has_alpha || webp_lossless {
+        WebpMode::Lossless
+    } else {
+        WebpMode::Lossy
+    }
+}
+
 pub fn encodes_for(
     format: SourceFormat,
     has_alpha: bool,
     color_count: Option<u32>,
+    width: u32,
+    height: u32,
     webp_lossless: bool,
 ) -> (bool, Vec<Encode>) {
-    let photo = is_photo(format, has_alpha, color_count);
-    // Graphics (and anything with alpha) are compared as lossless WebP.
-    // Photos use lossy WebP unless the user turned lossless on.
-    let webp_mode = if !photo || has_alpha || webp_lossless {
+    let photo = saves_as_jpeg(format, has_alpha, color_count, width, height);
+    // Small art (and anything with alpha) is compared as lossless WebP.
+    // Photos and large opaque images use lossy WebP unless the user turned lossless on.
+    let webp_mode = if !photo || webp_lossless {
         WebpMode::Lossless
     } else {
         WebpMode::Lossy
@@ -323,7 +350,7 @@ mod tests {
 
     #[test]
     fn graphics_request_png_and_lossless_webp() {
-        let (photo, encodes) = encodes_for(SourceFormat::Png, true, Some(10), false);
+        let (photo, encodes) = encodes_for(SourceFormat::Png, true, Some(10), 2000, 2000, false);
         assert!(!photo);
         assert_eq!(
             encodes,
@@ -332,8 +359,42 @@ mod tests {
     }
 
     #[test]
+    fn small_art_stays_png_and_large_art_saves_as_jpeg() {
+        let (small, small_encodes) =
+            encodes_for(SourceFormat::Png, false, Some(40), 256, 256, false);
+        assert!(!small);
+        assert_eq!(
+            small_encodes,
+            vec![Encode::Png, Encode::Webp(WebpMode::Lossless)]
+        );
+
+        let (large, large_encodes) =
+            encodes_for(SourceFormat::Png, false, Some(40), 1600, 900, false);
+        assert!(large);
+        assert_eq!(
+            large_encodes,
+            vec![Encode::Jpeg, Encode::Webp(WebpMode::Lossy)]
+        );
+
+        assert!(!saves_as_jpeg(
+            SourceFormat::Png,
+            true,
+            Some(40),
+            4000,
+            3000
+        ));
+    }
+
+    #[test]
+    fn webp_chip_keeps_transparency_lossless() {
+        assert_eq!(webp_chip_mode(true, false), WebpMode::Lossless);
+        assert_eq!(webp_chip_mode(false, false), WebpMode::Lossy);
+        assert_eq!(webp_chip_mode(false, true), WebpMode::Lossless);
+    }
+
+    #[test]
     fn photos_request_jpeg_and_lossy_webp() {
-        let (photo, encodes) = encodes_for(SourceFormat::Jpeg, false, None, false);
+        let (photo, encodes) = encodes_for(SourceFormat::Jpeg, false, None, 400, 300, false);
         assert!(photo);
         assert_eq!(
             encodes,
