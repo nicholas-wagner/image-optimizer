@@ -10,6 +10,7 @@ mod licenses;
 mod model;
 mod settings;
 mod tools;
+mod update;
 
 use eframe::egui;
 

@@ -82,6 +82,24 @@ struct RowPatch {
     error: Option<String>,
 }
 
+enum UpdateEvent {
+    Offer(String),
+    Clear,
+    Installed(String),
+    CannotReplace(String),
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UpdateOffer {
+    None,
+    Available(String),
+    Installing(String),
+    Restart(String),
+    CannotReplace(String),
+    Failed { version: String, message: String },
+}
+
 enum Msg {
     Row { gen: u64, index: usize, patch: RowPatch },
     WorkingOn { gen: u64, index: usize, name: String },
@@ -147,6 +165,14 @@ pub struct OptimizerApp {
     rx: Option<Receiver<Msg>>,
     tx: Sender<Msg>,
     show_licenses: bool,
+    update_tx: Sender<UpdateEvent>,
+    update_rx: Receiver<UpdateEvent>,
+    update_offer: UpdateOffer,
+    update_busy: bool,
+    /// Version last reported by GitHub. Kept so a closed window still shows the banner.
+    offered_version: String,
+    /// Version the user hid with Not now. A newer tag shows the banner again.
+    dismissed_update: String,
     picker: Option<DirPicker>,
     preview_path: Option<PathBuf>,
     preview_output: Option<PathBuf>,
@@ -188,6 +214,9 @@ impl OptimizerApp {
         };
         let advanced = stored_flag(cc.storage, "advanced");
         let coach_dismissed = stored_flag(cc.storage, "coach");
+        let dismissed_update = stored_string(cc.storage, "update_dismissed");
+        let offered_version = stored_string(cc.storage, "update_offer");
+        let (update_tx, update_rx) = mpsc::channel();
         apply_theme(&cc.egui_ctx);
         let mut app = Self {
             settings,
@@ -210,6 +239,12 @@ impl OptimizerApp {
             rx: Some(rx),
             tx,
             show_licenses: false,
+            update_tx,
+            update_rx,
+            update_offer: UpdateOffer::None,
+            update_busy: false,
+            offered_version,
+            dismissed_update,
             picker: None,
             preview_path: None,
             preview_output: None,
@@ -220,6 +255,29 @@ impl OptimizerApp {
             compare_actual: false,
             compare_large: false,
         };
+        app.restore_update_offer();
+        if let Ok(version) = std::env::var("IMAGE_OPTIMIZER_UPDATE") {
+            // In-memory only, so a preview does not stick in saved settings.
+            if crate::update::is_newer_than_running(&version) {
+                app.update_offer = UpdateOffer::Available(version);
+            }
+        } else {
+            let tx = app.update_tx.clone();
+            let ctx = cc.egui_ctx.clone();
+            thread::spawn(move || {
+                let event = match crate::update::check_if_due() {
+                    crate::update::Check::Available(version) => Some(UpdateEvent::Offer(version)),
+                    crate::update::Check::UpToDate => Some(UpdateEvent::Clear),
+                    crate::update::Check::Skipped
+                    | crate::update::Check::RateLimited
+                    | crate::update::Check::Failed => None,
+                };
+                if let Some(event) = event {
+                    let _ = tx.send(event);
+                }
+                ctx.request_repaint();
+            });
+        }
         if std::env::var_os("IMAGE_OPTIMIZER_PICKER").is_some() {
             app.open_picker(PickerPurpose::Images);
         }
@@ -320,9 +378,107 @@ impl OptimizerApp {
                 self.log.clear();
             }
         }
-        if self.running {
+        if self.running || self.update_busy {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
+        self.poll_update();
+    }
+
+    fn restore_update_offer(&mut self) {
+        if crate::update::is_newer_than_running(&self.offered_version)
+            && self.offered_version != self.dismissed_update
+        {
+            self.update_offer = UpdateOffer::Available(self.offered_version.clone());
+        }
+    }
+
+    fn poll_update(&mut self) {
+        while let Ok(event) = self.update_rx.try_recv() {
+            if self.update_busy && matches!(event, UpdateEvent::Offer(_) | UpdateEvent::Clear) {
+                if let UpdateEvent::Offer(version) = event {
+                    if crate::update::is_newer_than_running(&version) {
+                        self.offered_version = version;
+                    }
+                }
+                continue;
+            }
+            self.update_busy = false;
+            match event {
+                UpdateEvent::Offer(version) => {
+                    if crate::update::is_newer_than_running(&version)
+                        && version != self.dismissed_update
+                    {
+                        self.offered_version = version.clone();
+                        self.update_offer = UpdateOffer::Available(version);
+                    }
+                }
+                UpdateEvent::Clear => {
+                    self.offered_version.clear();
+                    if matches!(self.update_offer, UpdateOffer::Available(_)) {
+                        self.update_offer = UpdateOffer::None;
+                    }
+                }
+                UpdateEvent::Installed(version) => {
+                    self.offered_version.clear();
+                    self.update_offer = UpdateOffer::Restart(version);
+                }
+                UpdateEvent::CannotReplace(version) => {
+                    self.update_offer = UpdateOffer::CannotReplace(version);
+                }
+                UpdateEvent::Failed(message) => {
+                    let version = match &self.update_offer {
+                        UpdateOffer::Installing(version) | UpdateOffer::Available(version) => {
+                            version.clone()
+                        }
+                        UpdateOffer::Failed { version, .. } => version.clone(),
+                        _ => self.offered_version.clone(),
+                    };
+                    self.update_offer = UpdateOffer::Failed { version, message };
+                }
+            }
+        }
+    }
+
+    fn start_update(&mut self, ctx: &egui::Context) {
+        if self.update_busy {
+            return;
+        }
+        let version = match &self.update_offer {
+            UpdateOffer::Available(version) | UpdateOffer::Installing(version) => version.clone(),
+            UpdateOffer::Failed { version, .. } => version.clone(),
+            _ => return,
+        };
+        if version.is_empty() {
+            return;
+        }
+        self.update_busy = true;
+        self.update_offer = UpdateOffer::Installing(version.clone());
+        let tx = self.update_tx.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let event = match crate::update::install() {
+                crate::update::Install::Updated(version) => UpdateEvent::Installed(version),
+                crate::update::Install::Unwritable => UpdateEvent::CannotReplace(version),
+                crate::update::Install::Failed(message) => UpdateEvent::Failed(message),
+            };
+            let _ = tx.send(event);
+            ctx.request_repaint();
+        });
+    }
+
+    fn restart_updated(&mut self) {
+        if self.running {
+            return;
+        }
+        let Err(err) = self_update::restart::restart();
+        let version = match &self.update_offer {
+            UpdateOffer::Restart(version) => version.clone(),
+            _ => String::new(),
+        };
+        self.update_offer = UpdateOffer::Failed {
+            version,
+            message: err.to_string(),
+        };
     }
 
     fn intake_drops(&mut self, ctx: &egui::Context) {
@@ -507,7 +663,7 @@ impl OptimizerApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
-            ui.heading("Image Optimizer");
+            ui.heading(format!("Image Optimizer {}", env!("CARGO_PKG_VERSION")));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add(egui::Button::new(egui::RichText::new("Licenses").size(14.0)))
@@ -527,6 +683,7 @@ impl OptimizerApp {
                 .size(14.0)
                 .color(muted_text()),
         );
+        self.update_banner(ui, ctx);
 
         if !self.advanced && !self.coach_dismissed && self.tools.is_ok() && self.rows.is_empty()
         {
@@ -738,6 +895,106 @@ impl OptimizerApp {
                 });
         }
         ui.add_space(8.0);
+    }
+
+    fn update_banner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(lead) = update_banner_lead(&self.update_offer) else {
+            return;
+        };
+        ui.add_space(10.0);
+        let mut update = false;
+        let mut dismiss = false;
+        let mut restart = false;
+        let mut download = false;
+        egui::Frame::NONE
+            .fill(egui::Color32::from_rgb(255, 247, 237))
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                egui::Color32::from_rgb(253, 186, 116),
+            ))
+            .inner_margin(egui::Margin::same(12))
+            .corner_radius(egui::CornerRadius::same(10))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(lead);
+                    match &self.update_offer {
+                        UpdateOffer::Available(_) | UpdateOffer::Failed { .. } => {
+                            let label = if matches!(self.update_offer, UpdateOffer::Failed { .. })
+                            {
+                                "Try again"
+                            } else {
+                                "Update"
+                            };
+                            if ui.button(label).clicked() {
+                                update = true;
+                            }
+                            if ui.button("Not now").clicked() {
+                                dismiss = true;
+                            }
+                        }
+                        UpdateOffer::Restart(_) => {
+                            let button = egui::Button::new("Restart");
+                            let response = ui
+                                .add_enabled(!self.running, button)
+                                .on_hover_text(if self.running {
+                                    "This waits until the current run finishes."
+                                } else {
+                                    "Closes this window and opens the new version."
+                                });
+                            if response.clicked() {
+                                restart = true;
+                            }
+                        }
+                        UpdateOffer::CannotReplace(version) => {
+                            let label = if version.is_empty() {
+                                "Download".to_string()
+                            } else {
+                                format!("Download {version}")
+                            };
+                            if ui
+                                .button(label)
+                                .on_hover_text(crate::update::RELEASES_URL)
+                                .clicked()
+                            {
+                                download = true;
+                            }
+                            if ui.button("Not now").clicked() {
+                                dismiss = true;
+                            }
+                        }
+                        UpdateOffer::Installing(_) | UpdateOffer::None => {}
+                    }
+                });
+            });
+        if update {
+            self.start_update(ctx);
+        }
+        if dismiss {
+            self.dismiss_update();
+        }
+        if restart {
+            self.restart_updated();
+        }
+        if download {
+            open_url(crate::update::RELEASES_URL);
+        }
+    }
+
+    fn dismiss_update(&mut self) {
+        // Not now hides this version. A failed download only hides the error for this launch,
+        // so the offer comes back next time from the saved version.
+        let hide = match &self.update_offer {
+            UpdateOffer::Available(version) | UpdateOffer::CannotReplace(version) => {
+                Some(version.clone())
+            }
+            _ => None,
+        };
+        if let Some(version) = hide {
+            if version == self.offered_version {
+                self.dismissed_update = version;
+            }
+        }
+        self.update_offer = UpdateOffer::None;
     }
 
     fn coach_banner(&mut self, ui: &mut egui::Ui) {
@@ -1541,6 +1798,8 @@ impl eframe::App for OptimizerApp {
             "coach",
             if self.coach_dismissed { "1" } else { "0" }.to_string(),
         );
+        storage.set_string("update_dismissed", self.dismissed_update.clone());
+        storage.set_string("update_offer", self.offered_version.clone());
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -2087,6 +2346,23 @@ fn stored_flag(storage: Option<&dyn eframe::Storage>, key: &str) -> bool {
         .and_then(|storage| storage.get_string(key))
         .as_deref()
         == Some("1")
+}
+
+fn stored_string(storage: Option<&dyn eframe::Storage>, key: &str) -> String {
+    storage
+        .and_then(|storage| storage.get_string(key))
+        .unwrap_or_default()
+}
+
+fn update_banner_lead(offer: &UpdateOffer) -> Option<String> {
+    match offer {
+        UpdateOffer::None => None,
+        UpdateOffer::Available(version) => Some(format!("{version} is ready")),
+        UpdateOffer::Installing(version) => Some(format!("Downloading {version}...")),
+        UpdateOffer::Restart(version) => Some(format!("{version} is installed")),
+        UpdateOffer::CannotReplace(_) => Some("Can't replace this file.".to_string()),
+        UpdateOffer::Failed { message, .. } => Some(format!("Update did not finish. {message}")),
+    }
 }
 
 fn mode_switch(ui: &mut egui::Ui, advanced: &mut bool) -> bool {
@@ -2733,6 +3009,22 @@ fn comparison_wipe_at(
     );
 }
 
+fn open_url(url: &str) {
+    #[cfg(target_os = "windows")]
+    let mut cmd = std::process::Command::new("cmd");
+    #[cfg(target_os = "windows")]
+    cmd.args(["/C", "start", "", url]);
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(target_os = "macos")]
+    cmd.arg(url);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    cmd.arg(url);
+    let _ = cmd.spawn();
+}
+
 fn open_dir(path: &Path) {
     #[cfg(target_os = "windows")]
     let mut cmd = std::process::Command::new("explorer");
@@ -2773,6 +3065,35 @@ mod tests {
 
         assert_eq!(step_kind(false, 0, 0, false), StepKind::NeedTools);
         assert_eq!(step_action(StepKind::NeedTools), "");
+    }
+
+    #[test]
+    fn the_update_banner_names_the_version() {
+        assert_eq!(update_banner_lead(&UpdateOffer::None), None);
+        assert_eq!(
+            update_banner_lead(&UpdateOffer::Available("0.2.4".into())).as_deref(),
+            Some("0.2.4 is ready")
+        );
+        assert_eq!(
+            update_banner_lead(&UpdateOffer::Installing("0.2.4".into())).as_deref(),
+            Some("Downloading 0.2.4...")
+        );
+        assert_eq!(
+            update_banner_lead(&UpdateOffer::Restart("0.2.4".into())).as_deref(),
+            Some("0.2.4 is installed")
+        );
+        assert_eq!(
+            update_banner_lead(&UpdateOffer::CannotReplace("0.2.4".into())).as_deref(),
+            Some("Can't replace this file.")
+        );
+        assert_eq!(
+            update_banner_lead(&UpdateOffer::Failed {
+                version: "0.2.4".into(),
+                message: "timed out".into(),
+            })
+            .as_deref(),
+            Some("Update did not finish. timed out")
+        );
     }
 
     fn sample_row(status: &str, output: bool, choice: RowChoice) -> FileRow {

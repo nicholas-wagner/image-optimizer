@@ -40,6 +40,8 @@ Pushing a tag such as `v0.1.0` builds both binaries and attaches them to a GitHu
 
 `chmod +x` the Linux file, then run it. On Windows, download the exe and double-click it.
 
+The app checks that release once a day. Click **Update** in the window to replace the file you are running.
+
 ## Build
 
 Linux, about 2 minutes if the tools are already built:
