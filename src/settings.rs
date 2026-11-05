@@ -6,6 +6,8 @@ pub enum Preset {
     Web,
     Compress,
     Lossless,
+    /// Every file is saved as PNG, with maximum compression.
+    Png,
     Custom,
 }
 
@@ -16,13 +18,20 @@ impl Default for Preset {
 }
 
 impl Preset {
-    pub const ALL: [Self; 4] = [Self::Web, Self::Compress, Self::Lossless, Self::Custom];
+    pub const ALL: [Self; 5] = [
+        Self::Web,
+        Self::Compress,
+        Self::Lossless,
+        Self::Png,
+        Self::Custom,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Web => "Web",
             Self::Compress => "Compress",
             Self::Lossless => "Lossless",
+            Self::Png => "PNG",
             Self::Custom => "Custom",
         }
     }
@@ -34,7 +43,12 @@ impl Preset {
                 "Photos and large images save as JPEG quality 90, 4:2:0. Small art stays PNG. WebP is used when it is at least 8% smaller."
             }
             Self::Lossless => "No quality loss. Best still picks JPEG, PNG, or WebP.",
-            Self::Custom => "The controls under Advanced options.",
+            Self::Png => {
+                "Every file is saved as PNG. Maximum compression is on, so large images take longer. Pick another style to let Best choose the format again."
+            }
+            Self::Custom => {
+                "Opens the controls for quality, size, and PNG. This card is selected when a style no longer matches."
+            }
         }
     }
 
@@ -52,6 +66,10 @@ impl Preset {
                 settings.jpeg_lossless = true;
                 settings.webp_lossless = true;
                 settings.resize_enabled = false;
+            }
+            Self::Png => {
+                settings.png_brute = true;
+                settings.png_only = true;
             }
             Self::Compress | Self::Custom => {}
         }
@@ -78,6 +96,9 @@ pub struct Settings {
     pub resize_max_edge: u32,
     #[serde(default)]
     pub png_brute: bool,
+    /// Smallest PNG. New files are saved as PNG until another style is picked.
+    #[serde(default)]
+    pub png_only: bool,
     #[serde(default = "default_true")]
     pub choose_best_format: bool,
     #[serde(default)]
@@ -113,6 +134,7 @@ impl Default for Settings {
             resize_enabled: false,
             resize_max_edge: default_max_edge(),
             png_brute: false,
+            png_only: false,
             choose_best_format: true,
             output_dir: None,
             preset: Preset::Compress,
@@ -139,6 +161,7 @@ impl Settings {
             && self.resize_enabled == other.resize_enabled
             && self.resize_max_edge == other.resize_max_edge
             && self.png_brute == other.png_brute
+            && self.png_only == other.png_only
             && self.choose_best_format == other.choose_best_format
             && self.output_dir == other.output_dir
     }
@@ -157,7 +180,7 @@ impl Settings {
     /// Highlight Web, Compress, or Lossless when the knobs match. Anything else is Custom.
     pub fn sync_preset(&mut self) {
         self.clamp();
-        for candidate in [Preset::Lossless, Preset::Web, Preset::Compress] {
+        for candidate in [Preset::Lossless, Preset::Web, Preset::Png, Preset::Compress] {
             let mut base = candidate.baseline();
             base.output_dir = self.output_dir.clone();
             if self.same_job(&base) {
@@ -231,6 +254,45 @@ mod tests {
         let mut settings = Settings::default();
         settings.jpeg_quality = 70;
         settings.preset = Preset::Compress;
+        settings.sync_preset();
+        assert_eq!(settings.preset, Preset::Custom);
+    }
+
+    #[test]
+    fn smallest_png_is_maximum_compression_and_png_output() {
+        let png = Preset::Png.baseline();
+        assert!(png.png_brute);
+        assert!(png.png_only);
+        assert!(!png.resize_enabled);
+        assert!(!png.jpeg_lossless);
+        assert!(!png.webp_lossless);
+        assert!(png.choose_best_format);
+        assert_eq!(png.jpeg_quality, 90);
+        assert!(!png.same_job(&Preset::Compress.baseline()));
+        let mut synced = png.clone();
+        synced.sync_preset();
+        assert_eq!(synced.preset, Preset::Png);
+
+        let mut job = Preset::Compress.baseline();
+        job.png_brute = true;
+        assert!(!job.same_job(&png));
+        job.png_only = true;
+        assert!(job.same_job(&png));
+    }
+
+    #[test]
+    fn turning_off_maximum_compression_keeps_png_output_as_your_settings() {
+        let mut settings = Preset::Png.baseline();
+        settings.png_brute = false;
+        settings.sync_preset();
+        assert_eq!(settings.preset, Preset::Custom);
+        assert!(settings.png_only);
+    }
+
+    #[test]
+    fn png_output_without_maximum_compression_is_not_the_png_style() {
+        let mut settings = Preset::Compress.baseline();
+        settings.png_only = true;
         settings.sync_preset();
         assert_eq!(settings.preset, Preset::Custom);
     }

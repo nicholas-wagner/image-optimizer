@@ -6,7 +6,7 @@ One file. Nothing to install. It optimizes JPEG, PNG, and WebP with the real `jp
 
 Linux / WSL: run `./image-optimizer`. The window opens in **Simple**.
 
-1. Pick a style. **Smaller file** keeps the full size. **For the web** shrinks the long side to 1600 px. **Perfect quality** does not reduce quality.
+1. Pick a style. **Smaller file** keeps the full size. **For the web** shrinks the long side to 1600 px. **Perfect quality** does not reduce quality. **Smallest PNG** saves every file as PNG with maximum compression. That one is slow.
 2. Click **Add images** at the bottom, or drop files onto the window.
 3. Click **Optimize**.
 
@@ -14,7 +14,7 @@ Originals stay untouched. Results land in an `optimized` folder next to the firs
 
 **Advanced**, in the header, opens the rest: quality sliders, resize, output folder, metadata, PNG maximum compression, per-file format (Best, JPEG, PNG, WebP, or Skip), add by path, and the command that ran. Check files to change their format together.
 
-**Your settings** appears when a control no longer matches a style. Picking a style again resets those controls and keeps the output folder. Changing a style or a slider brings the button back to **Optimize**.
+**Your settings** appears when a control no longer matches a style. In Advanced, clicking it scrolls the controls into view when a preview would hide them. Picking a style again resets those controls and keeps the output folder. Changing a style or a slider brings the button back to **Optimize**.
 
 Windows: run `image-optimizer.exe`. It uses the normal Windows file dialog.
 
@@ -22,7 +22,7 @@ The first launch unpacks the three tools into `~/.cache/image-optimizer/bin/`. I
 
 ## Defaults
 
-- **Smaller file** (Compress) is the starting preset: full size, JPEG max quality 90, WebP quality 80, Best format. **For the web** (Web) is the same with resize on at 1600 px. **Perfect quality** (Lossless) turns on lossless JPEG and lossless WebP. Any other slider change is **Your settings** (Custom).
+- **Smaller file** (Compress) is the starting preset: full size, JPEG max quality 90, WebP quality 80, Best format. **For the web** (Web) is the same with resize on at 1600 px. **Perfect quality** (Lossless) turns on lossless JPEG and lossless WebP. **Smallest PNG** saves every file as PNG and turns on maximum compression. Any other slider change is **Your settings** (Custom).
 - JPEG max quality is 90 (`jpegoptim --max=90`). Move the slider to change it. Lossless JPEG turns the cap off.
 - Files already saved at 90 or below are only optimized losslessly.
 - WebP quality is 80. Lossless WebP and images with transparency use `cwebp -lossless -z 6 -exact`.

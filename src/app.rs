@@ -159,6 +159,8 @@ pub struct OptimizerApp {
     job_settings: Option<Settings>,
     active_file: String,
     force_options_open: bool,
+    /// Your settings was clicked. Scroll the controls up when a preview hides them.
+    scroll_options: bool,
     advanced: bool,
     coach_dismissed: bool,
     cancel: Option<CancelFlag>,
@@ -233,6 +235,7 @@ impl OptimizerApp {
             job_settings: None,
             active_file: String::new(),
             force_options_open: false,
+            scroll_options: false,
             advanced,
             coach_dismissed,
             cancel: None,
@@ -525,7 +528,7 @@ impl OptimizerApp {
         self.rows.push(FileRow {
             path,
             info,
-            choice: RowChoice::Recommended,
+            choice: new_file_choice(self.settings.png_only),
             recommendation: None,
             measured: None,
             output_bytes: None,
@@ -865,11 +868,22 @@ impl OptimizerApp {
                 options = options.open(Some(true));
                 self.force_options_open = false;
             }
-            options.show(ui, |ui| {
+            let shown = options.show(ui, |ui| {
                 ui.add_enabled_ui(!self.running, |ui| {
                     self.settings_ui(ui);
                 });
             });
+            if self.scroll_options {
+                let clip = ui.clip_rect();
+                let header = &shown.header_response;
+                if options_need_scroll(header.rect.top(), clip.top(), clip.bottom()) {
+                    header.scroll_to_me_animation(
+                        Some(egui::Align::TOP),
+                        egui::style::ScrollAnimation::duration(0.35),
+                    );
+                }
+                self.scroll_options = false;
+            }
         } else if self.tools.is_ok() {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
@@ -1040,9 +1054,25 @@ impl OptimizerApp {
         if preset == Preset::Custom {
             self.advanced = true;
             self.force_options_open = true;
+            self.scroll_options = true;
             return;
         }
+        let leaving_png = self.settings.png_only && preset != Preset::Png;
         self.settings.apply_preset(preset);
+        if self.settings.png_only {
+            self.apply_choice_to_rows(RowChoice::Png, None);
+        } else if leaving_png {
+            self.apply_choice_to_rows(RowChoice::Recommended, Some(RowChoice::Png));
+        }
+    }
+
+    fn apply_choice_to_rows(&mut self, choice: RowChoice, only: Option<RowChoice>) {
+        for index in 0..self.rows.len() {
+            let Some(next) = next_row_choice(self.rows[index].choice, choice, only) else {
+                continue;
+            };
+            self.set_choice(index, next);
+        }
     }
 
     fn action_bar(&mut self, ui: &mut egui::Ui) {
@@ -1372,8 +1402,14 @@ impl OptimizerApp {
             );
             hint(
                 ui,
-                "Tries many more PNG strategies. Useful for icons and screenshots. Slow on large photos.",
+                "Tries many more PNG strategies. Useful for icons and screenshots. Slow on large photos. The Smallest PNG style turns this on.",
             );
+            if self.settings.png_only {
+                hint(
+                    ui,
+                    "Smallest PNG is saving these files as PNG. Pick another style to let Best choose again.",
+                );
+            }
             ui.add_space(4.0);
             ui.label(egui::RichText::new("Add by path").strong());
             hint(ui, "A file or a folder. Press Enter to add it.");
@@ -2403,11 +2439,50 @@ fn mode_button(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
 }
 
 fn visible_presets(advanced: bool, current: Preset) -> Vec<Preset> {
+    let mut presets: Vec<Preset> = Preset::ALL
+        .into_iter()
+        .filter(|preset| *preset != Preset::Custom)
+        .collect();
     if advanced || current == Preset::Custom {
-        Preset::ALL.to_vec()
-    } else {
-        vec![Preset::Web, Preset::Compress, Preset::Lossless]
+        presets.push(Preset::Custom);
     }
+    presets
+}
+
+/// Your settings sits under the file list. A preview makes that list tall, so the
+/// controls can be entirely below the window. 120 px is the header plus the first
+/// control. Less than that reads as a click that did nothing.
+fn options_need_scroll(header_top: f32, clip_top: f32, clip_bottom: f32) -> bool {
+    if header_top < clip_top {
+        return false;
+    }
+    clip_bottom - header_top < 120.0
+}
+
+fn new_file_choice(png_only: bool) -> RowChoice {
+    if png_only {
+        RowChoice::Png
+    } else {
+        RowChoice::Recommended
+    }
+}
+
+/// Skip is left alone. `only` limits the change to rows already on that choice.
+fn next_row_choice(
+    current: RowChoice,
+    next: RowChoice,
+    only: Option<RowChoice>,
+) -> Option<RowChoice> {
+    if current == RowChoice::Skip {
+        return None;
+    }
+    if only.is_some_and(|from| current != from) {
+        return None;
+    }
+    if current == next {
+        return None;
+    }
+    Some(next)
 }
 
 fn preset_plain(preset: Preset) -> (&'static str, &'static str) {
@@ -2424,14 +2499,21 @@ fn preset_plain(preset: Preset) -> (&'static str, &'static str) {
             "Perfect quality",
             "Looks identical. The file gets a little smaller.",
         ),
-        Preset::Custom => ("Your settings", "Uses the quality and size you set."),
+        Preset::Png => (
+            "Smallest PNG",
+            "Every file becomes a PNG, with maximum compression. Slow.",
+        ),
+        Preset::Custom => (
+            "Your settings",
+            "Shows the controls for quality, size, and PNG.",
+        ),
     }
 }
 
 fn preset_card(ui: &mut egui::Ui, preset: Preset, selected: bool, show_badge: bool) -> egui::Response {
     let (title, detail) = preset_plain(preset);
     let width = ui.available_width();
-    let height = if show_badge { 138.0 } else { 112.0 };
+    let height = if show_badge { 156.0 } else { 124.0 };
     let fill = if selected {
         egui::Color32::from_rgb(255, 247, 237)
     } else {
@@ -3197,10 +3279,47 @@ mod tests {
     fn simple_mode_hides_custom_until_the_settings_leave_a_style() {
         assert_eq!(
             visible_presets(false, Preset::Compress),
-            vec![Preset::Web, Preset::Compress, Preset::Lossless]
+            vec![Preset::Web, Preset::Compress, Preset::Lossless, Preset::Png]
         );
         assert_eq!(visible_presets(false, Preset::Custom), Preset::ALL.to_vec());
         assert_eq!(visible_presets(true, Preset::Web), Preset::ALL.to_vec());
+        assert!(!visible_presets(false, Preset::Png).contains(&Preset::Custom));
+    }
+
+    #[test]
+    fn your_settings_scrolls_only_when_the_controls_are_below_the_preview() {
+        // Empty list: the header and the first controls are already on screen.
+        assert!(!options_need_scroll(400.0, 16.0, 660.0));
+        // Preview pushed the controls past the bottom of the window.
+        assert!(options_need_scroll(700.0, 16.0, 660.0));
+        // Only the header peeks in. That reads as a click that did nothing.
+        assert!(options_need_scroll(560.0, 16.0, 660.0));
+        // The user already scrolled to the controls.
+        assert!(!options_need_scroll(80.0, 400.0, 660.0));
+    }
+
+    #[test]
+    fn smallest_png_sets_png_and_leaves_skip_and_other_overrides() {
+        assert_eq!(new_file_choice(false), RowChoice::Recommended);
+        assert_eq!(new_file_choice(true), RowChoice::Png);
+        assert_eq!(
+            next_row_choice(RowChoice::Recommended, RowChoice::Png, None),
+            Some(RowChoice::Png)
+        );
+        assert_eq!(next_row_choice(RowChoice::Skip, RowChoice::Png, None), None);
+        assert_eq!(next_row_choice(RowChoice::Png, RowChoice::Png, None), None);
+        assert_eq!(
+            next_row_choice(RowChoice::Png, RowChoice::Recommended, Some(RowChoice::Png)),
+            Some(RowChoice::Recommended)
+        );
+        assert_eq!(
+            next_row_choice(RowChoice::Jpeg, RowChoice::Recommended, Some(RowChoice::Png)),
+            None
+        );
+        assert_eq!(
+            next_row_choice(RowChoice::Skip, RowChoice::Recommended, Some(RowChoice::Png)),
+            None
+        );
     }
 
     #[test]
