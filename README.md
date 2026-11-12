@@ -6,7 +6,7 @@ One file. Nothing to install. It optimizes JPEG, PNG, and WebP with the real `jp
 
 Linux / WSL: run `./image-optimizer`. The window opens in **Simple**.
 
-1. Pick a style. **Smaller file** keeps the full size. **For the web** shrinks the long side to 1600 px. **Perfect quality** does not reduce quality. **Smallest PNG** saves every file as PNG with maximum compression. That one is slow.
+1. Pick a style. **Smaller file** keeps the full size. **For the web** shrinks the long side to 1600 px. **For email** shrinks the long side to 1200 px and saves JPEG or PNG only. **Perfect quality** does not reduce quality. **Smallest PNG** saves every file as PNG with maximum compression. That one is slow.
 2. Click **Add images** at the bottom, or drop files onto the window.
 3. Click **Optimize**.
 
@@ -22,14 +22,14 @@ The first launch unpacks the three tools into `~/.cache/image-optimizer/bin/`. I
 
 ## Defaults
 
-- **Smaller file** (Compress) is the starting preset: full size, JPEG max quality 90, WebP quality 80, Best format. **For the web** (Web) is the same with resize on at 1600 px. **Perfect quality** (Lossless) turns on lossless JPEG and lossless WebP. **Smallest PNG** saves every file as PNG and turns on maximum compression. Any other slider change is **Your settings** (Custom).
-- JPEG max quality is 90 (`jpegoptim --max=90`). Move the slider to change it. Lossless JPEG turns the cap off.
+- **Smaller file** (Compress) is the starting preset: full size, JPEG max quality 90, WebP quality 80, Best format. **For the web** (Web) is the same with resize on at 1600 px. **For email** (Email) shrinks the long side to 1200 px and does not enlarge smaller images. JPEG is capped at 85 and written progressive. Camera and location data are removed, and the color profile stays. Photos save as JPEG. Graphics and images with transparency save as PNG with normal compression. WebP is not used. **Perfect quality** (Lossless) turns on lossless JPEG and lossless WebP. **Smallest PNG** saves every file as PNG and turns on maximum compression. Any other slider change is **Your settings** (Custom).
+- JPEG max quality is 90 (`jpegoptim --max=90`). **For email** uses 85 (`jpegoptim --max=85`) and `jpegoptim --all-progressive`. Move the slider to change the cap. Lossless JPEG turns the cap off.
 - Files already saved at 90 or below are only optimized losslessly.
 - WebP quality is 80. Lossless WebP and images with transparency use `cwebp -lossless -z 6 -exact`.
-- PNG uses `pngcrush -reduce`. Maximum compression adds `-brute` and is slow.
-- Strip metadata is off.
-- Resize is off in **Compress**. **Web** turns it on at 1600 px. Size chips are 800, 1600, and 1920. That is what cuts multi‑megabyte photos down for the web.
-- Recommend compares candidates and picks the smaller format. WebP has to be at least 8% smaller than JPEG (photos) or PNG (graphics), and the winner has to save at least 3%, or the original is kept.
+- PNG uses `pngcrush -reduce`. Maximum compression adds `-brute` and is slow. **For email** does not turn that on.
+- Strip metadata is off, except in **For email**. Stripping removes comments, Exif, IPTC, and XMP, and keeps the ICC profile (`jpegoptim --keep-icc`, and pngcrush does not remove `iCCP`).
+- Resize is off in **Compress**. **Web** turns it on at 1600 px. **For email** turns it on at 1200 px and does not enlarge a smaller image. Size chips are 800, 1200, 1600, and 1920. That is what cuts multi‑megabyte photos down for the web and for email.
+- Recommend compares candidates and picks the smaller format. WebP has to be at least 8% smaller than JPEG (photos) or PNG (graphics), and the winner has to save at least 3%, or the original is kept. **For email** never offers WebP. It keeps that JPEG-or-PNG choice.
 
 ## Releases
 

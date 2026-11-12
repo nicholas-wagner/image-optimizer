@@ -1064,6 +1064,9 @@ impl OptimizerApp {
         } else if leaving_png {
             self.apply_choice_to_rows(RowChoice::Recommended, Some(RowChoice::Png));
         }
+        if !self.settings.webp_allowed {
+            self.apply_choice_to_rows(RowChoice::Recommended, Some(RowChoice::Webp));
+        }
     }
 
     fn apply_choice_to_rows(&mut self, choice: RowChoice, only: Option<RowChoice>) {
@@ -1199,9 +1202,12 @@ impl OptimizerApp {
         ui.label(egui::RichText::new(title).strong());
         ui.horizontal_wrapped(|ui| {
             for choice in RowChoice::ALL {
+                if choice == RowChoice::Webp && !self.settings.webp_allowed {
+                    continue;
+                }
                 if ui
                     .selectable_label(shared == Some(choice), choice.label())
-                    .on_hover_text(choice_tip(choice))
+                    .on_hover_text(choice_tip(choice, self.settings.webp_allowed))
                     .clicked()
                 {
                     for index in targets.clone() {
@@ -1297,6 +1303,12 @@ impl OptimizerApp {
                     "Files already saved at this quality or lower are left as they are.",
                 );
             }
+            if self.settings.jpeg_progressive && !self.settings.jpeg_lossless {
+                hint(
+                    ui,
+                    "Progressive JPEG, so the picture appears while it is still loading.",
+                );
+            }
             ui.add_space(6.0);
             let webp_on = !self.settings.webp_lossless;
             ui.add_enabled(
@@ -1319,7 +1331,7 @@ impl OptimizerApp {
         group_card(ui, "Size", |ui| {
             ui.checkbox(&mut self.settings.resize_enabled, "Shrink the long side");
             ui.horizontal_wrapped(|ui| {
-                for edge in [800_u32, 1600, 1920] {
+                for edge in [800_u32, 1200, 1600, 1920] {
                     let on = self.settings.resize_enabled && self.settings.resize_max_edge == edge;
                     let mut text = egui::RichText::new(format!("{edge} px"));
                     if on {
@@ -1331,6 +1343,7 @@ impl OptimizerApp {
                     }
                     let tip = match edge {
                         800 => "Small, for thumbnails and tight pages.",
+                        1200 => "The For email style. Sharp on a high-resolution screen.",
                         1600 => "The For the web style. Enough for a normal page.",
                         _ => "Sharper, for large layouts.",
                     };
@@ -1348,7 +1361,7 @@ impl OptimizerApp {
             );
             hint(
                 ui,
-                "Phone photos are often 4000 px. 1600 px is what makes them small enough to send.",
+                "Phone photos are often 4000 px. For email uses 1200 px. For the web uses 1600 px. Smaller pictures stay their own size.",
             );
         });
 
@@ -1379,7 +1392,7 @@ impl OptimizerApp {
             );
             hint(
                 ui,
-                "Strips hidden metadata. The picture looks the same.",
+                "Removes camera and location data. The color profile stays, so the colors do not shift.",
             );
         });
 
@@ -1388,10 +1401,15 @@ impl OptimizerApp {
                 &mut self.settings.choose_best_format,
                 "Compare formats and keep the smaller one",
             );
-            if self.settings.choose_best_format {
+            if self.settings.choose_best_format && self.settings.webp_allowed {
                 hint(
                     ui,
                     "Photos and large images (long side 1200 px or more) are compared as JPEG quality 90, 4:2:0. Small art stays PNG. WebP is used only when it is at least 8% smaller, and the winner has to save at least 3%.",
+                );
+            } else if self.settings.choose_best_format {
+                hint(
+                    ui,
+                    "Photos and large images are saved as JPEG. Graphics and transparency stay PNG. WebP is not used. Pick another style to compare WebP again.",
                 );
             } else {
                 hint(ui, "Each file stays in its own format and is only recompressed.");
@@ -2489,7 +2507,11 @@ fn preset_plain(preset: Preset) -> (&'static str, &'static str) {
     match preset {
         Preset::Web => (
             "For the web",
-            "Shrinks the long side to 1600 px for sites and email.",
+            "Shrinks the long side to 1600 px for a web page.",
+        ),
+        Preset::Email => (
+            "For email",
+            "Long side 1200 px. JPEG or PNG, small and sharp.",
         ),
         Preset::Compress => (
             "Smaller file",
@@ -2668,8 +2690,11 @@ fn webp_savings_line(row: &FileRow, stale: bool, webp_lossless: bool) -> Option<
     }
 }
 
-fn choice_tip(choice: RowChoice) -> &'static str {
+fn choice_tip(choice: RowChoice, webp_allowed: bool) -> &'static str {
     match choice {
+        RowChoice::Recommended if !webp_allowed => {
+            "Photos and large images are saved as JPEG. Small art and transparency stay PNG."
+        }
         RowChoice::Recommended => {
             "Photos and large images are compared as JPEG. Small art is compared as PNG. WebP wins when it is at least 8% smaller."
         }
@@ -2885,6 +2910,7 @@ fn optimize_item(
         item.info.format,
         item.info.has_alpha,
         settings.webp_lossless,
+        settings.webp_allowed,
     );
     let encode = match encode {
         Ok(Some(encode)) => encode,
@@ -2917,7 +2943,7 @@ fn optimize_item(
     ) {
         Ok(outcome) => {
             let mut patch = done_patch(outcome);
-            if matches!(encode, Encode::Jpeg | Encode::Png) {
+            if settings.webp_allowed && matches!(encode, Encode::Jpeg | Encode::Png) {
                 let mode = model::webp_chip_mode(item.info.has_alpha, settings.webp_lossless);
                 if let Ok(webp_bytes) = execute::measure_webp(
                     tools,
@@ -3279,11 +3305,35 @@ mod tests {
     fn simple_mode_hides_custom_until_the_settings_leave_a_style() {
         assert_eq!(
             visible_presets(false, Preset::Compress),
-            vec![Preset::Web, Preset::Compress, Preset::Lossless, Preset::Png]
+            vec![
+                Preset::Web,
+                Preset::Email,
+                Preset::Compress,
+                Preset::Lossless,
+                Preset::Png,
+            ]
         );
         assert_eq!(visible_presets(false, Preset::Custom), Preset::ALL.to_vec());
         assert_eq!(visible_presets(true, Preset::Web), Preset::ALL.to_vec());
         assert!(!visible_presets(false, Preset::Png).contains(&Preset::Custom));
+        assert!(visible_presets(false, Preset::Email).contains(&Preset::Email));
+        assert!(!visible_presets(false, Preset::Email).contains(&Preset::Custom));
+    }
+
+    #[test]
+    fn email_puts_a_webp_row_back_on_best_and_leaves_jpeg_alone() {
+        assert_eq!(
+            next_row_choice(RowChoice::Webp, RowChoice::Recommended, Some(RowChoice::Webp)),
+            Some(RowChoice::Recommended)
+        );
+        assert_eq!(
+            next_row_choice(RowChoice::Jpeg, RowChoice::Recommended, Some(RowChoice::Webp)),
+            None
+        );
+        assert_eq!(
+            next_row_choice(RowChoice::Skip, RowChoice::Recommended, Some(RowChoice::Webp)),
+            None
+        );
     }
 
     #[test]
