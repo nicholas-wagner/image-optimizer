@@ -10,8 +10,18 @@ pub fn jpegoptim_args(settings: &Settings, input: &Path, dest_dir: &Path) -> Vec
     if !settings.jpeg_lossless {
         args.push(format!("--max={}", settings.jpeg_quality.min(100)));
     }
+    if settings.jpeg_progressive {
+        args.push("--all-progressive".to_string());
+    }
     if settings.strip_metadata {
-        args.push("--strip-all".to_string());
+        // Keep the ICC profile. --strip-all would drop it and shift wide-gamut photos.
+        args.extend([
+            "--strip-com".to_string(),
+            "--strip-exif".to_string(),
+            "--strip-iptc".to_string(),
+            "--strip-xmp".to_string(),
+            "--keep-icc".to_string(),
+        ]);
     }
     args.push(input.display().to_string());
     args
@@ -20,8 +30,11 @@ pub fn jpegoptim_args(settings: &Settings, input: &Path, dest_dir: &Path) -> Vec
 pub fn pngcrush_args(settings: &Settings, input: &Path, output: &Path) -> Vec<String> {
     let mut args = vec!["-q".to_string(), "-reduce".to_string()];
     if settings.strip_metadata {
-        args.push("-rem".to_string());
-        args.push("alla".to_string());
+        // Text and timestamps go. iCCP, gAMA, and sRGB stay so the colors do not shift.
+        for chunk in ["tEXt", "zTXt", "iTXt", "tIME", "eXIf"] {
+            args.push("-rem".to_string());
+            args.push(chunk.to_string());
+        }
     }
     if settings.png_brute {
         args.push("-brute".to_string());
@@ -53,8 +66,10 @@ pub fn cwebp_args(settings: &Settings, mode: WebpMode, input: &Path, output: &Pa
         }
     }
     args.push("-mt".to_string());
-    if !settings.strip_metadata {
-        args.push("-metadata".to_string());
+    args.push("-metadata".to_string());
+    if settings.strip_metadata {
+        args.push("icc".to_string());
+    } else {
         args.push("all".to_string());
     }
     args.push(input.display().to_string());
@@ -89,7 +104,10 @@ mod tests {
         let (input, dest) = paths();
         let args = jpegoptim_args(&Settings::default(), &input, &dest);
         assert!(args.iter().any(|arg| arg == "--max=90"));
-        assert!(!args.iter().any(|arg| arg == "--strip-all"));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--strip-all" || arg == "--strip-exif"));
+        assert!(!args.iter().any(|arg| arg == "--all-progressive"));
         assert!(args.iter().any(|arg| arg == "--overwrite"));
     }
 
@@ -117,11 +135,35 @@ mod tests {
         let mut settings = Settings::default();
         settings.strip_metadata = true;
         let jpeg = jpegoptim_args(&settings, &input, &dest);
-        assert!(jpeg.iter().any(|arg| arg == "--strip-all"));
+        assert!(jpeg.iter().any(|arg| arg == "--strip-exif"));
+        assert!(jpeg.iter().any(|arg| arg == "--strip-com"));
+        assert!(jpeg.iter().any(|arg| arg == "--strip-iptc"));
+        assert!(jpeg.iter().any(|arg| arg == "--strip-xmp"));
+        assert!(jpeg.iter().any(|arg| arg == "--keep-icc"));
+        assert!(!jpeg
+            .iter()
+            .any(|arg| arg == "--strip-all" || arg == "--strip-icc"));
         let png = pngcrush_args(&settings, &input, &dest);
-        assert!(png.windows(2).any(|pair| pair == ["-rem", "alla"]));
+        assert!(png.windows(2).any(|pair| pair == ["-rem", "tEXt"]));
+        assert!(png.windows(2).any(|pair| pair == ["-rem", "eXIf"]));
+        assert!(!png.windows(2).any(|pair| pair == ["-rem", "alla"]));
+        assert!(!png.windows(2).any(|pair| pair == ["-rem", "iCCP"]));
         let webp = cwebp_args(&settings, WebpMode::Lossy, &input, &dest);
-        assert!(!webp.iter().any(|arg| arg == "-metadata"));
+        assert!(webp.windows(2).any(|pair| pair == ["-metadata", "icc"]));
+    }
+
+    #[test]
+    fn email_jpeg_is_progressive_and_capped() {
+        use crate::settings::Preset;
+        let (input, dest) = paths();
+        let args = jpegoptim_args(&Preset::Email.baseline(), &input, &dest);
+        assert!(args.iter().any(|arg| arg == "--max=85"));
+        assert!(args.iter().any(|arg| arg == "--all-progressive"));
+        assert!(args.iter().any(|arg| arg == "--strip-exif"));
+        assert!(args.iter().any(|arg| arg == "--keep-icc"));
+        let png = pngcrush_args(&Preset::Email.baseline(), &input, &dest);
+        assert!(png.iter().any(|arg| arg == "-reduce"));
+        assert!(!png.iter().any(|arg| arg == "-brute"));
     }
 
     #[test]

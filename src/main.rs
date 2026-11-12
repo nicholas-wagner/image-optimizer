@@ -18,8 +18,8 @@ fn main() -> eframe::Result {
     bootstrap::ensure_runtime();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1120.0, 800.0])
-            .with_min_inner_size([900.0, 640.0])
+            .with_inner_size([1200.0, 800.0])
+            .with_min_inner_size([1080.0, 640.0])
             .with_drag_and_drop(true)
             .with_title("Image Optimizer"),
         persist_window: true,

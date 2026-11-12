@@ -10,7 +10,7 @@ use crate::model::{self, Decision, Encode, Recommendation, SourceFormat, WebpMod
 use crate::settings::Settings;
 use crate::tools::ToolPaths;
 use image::codecs::jpeg::JpegEncoder;
-use image::{DynamicImage, ExtendedColorType, ImageEncoder, ImageFormat};
+use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder};
 use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -109,6 +109,7 @@ pub fn recommend_file(
         info.width,
         info.height,
         settings.webp_lossless,
+        settings.webp_allowed,
     );
     let scratch = Scratch::new("recommend")?;
     let mut sizes = Vec::new();
@@ -246,7 +247,7 @@ fn materialize_input(
         return Ok(src.to_path_buf());
     }
 
-    let image = image::open(src).map_err(|err| err.to_string())?;
+    let (image, profile) = load_image(src)?;
     let (width, height) = (image.width(), image.height());
     let image = if resize {
         let (nw, nh) = model::fit(width, height, settings.resize_max_edge);
@@ -269,23 +270,55 @@ fn materialize_input(
                 note.push_str("alpha flattened onto white");
             }
             let path = scratch.path.join("input.jpg");
-            write_jpeg(&image, &path, 100)?;
+            write_jpeg(&image, &path, 100, profile.as_deref())?;
             Ok(path)
         }
         Encode::Png | Encode::Webp(_) => {
             let path = scratch.path.join("input.png");
-            image
-                .save_with_format(&path, ImageFormat::Png)
-                .map_err(|err| err.to_string())?;
+            write_png(&image, &path, profile.as_deref())?;
             Ok(path)
         }
     }
 }
 
-fn write_jpeg(image: &DynamicImage, path: &Path, quality: u8) -> Result<(), String> {
+/// Decode pixels, apply the Exif orientation, and keep the ICC profile.
+/// Stripping metadata later can drop the orientation tag. The pixels are
+/// turned upright first, and the profile stays with them so colors do not shift.
+fn load_image(path: &Path) -> Result<(DynamicImage, Option<Vec<u8>>), String> {
+    let reader = image::ImageReader::open(path)
+        .map_err(|err| err.to_string())?
+        .with_guessed_format()
+        .map_err(|err| err.to_string())?;
+    let mut decoder = reader.into_decoder().map_err(|err| err.to_string())?;
+    let profile = decoder
+        .icc_profile()
+        .ok()
+        .flatten()
+        .filter(|bytes| !bytes.is_empty());
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut image = DynamicImage::from_decoder(decoder).map_err(|err| err.to_string())?;
+    image.apply_orientation(orientation);
+    Ok((image, profile))
+}
+
+fn write_jpeg(
+    image: &DynamicImage,
+    path: &Path,
+    quality: u8,
+    icc: Option<&[u8]>,
+) -> Result<(), String> {
+    // JpegEncoder has no subsampling control. It writes 4:4:4. A later
+    // lossy jpegoptim --max recompresses that to libjpeg's default 4:2:0.
     let rgb = flatten_rgb(image);
     let file = fs::File::create(path).map_err(|err| err.to_string())?;
-    let encoder = JpegEncoder::new_with_quality(BufWriter::new(file), quality);
+    let mut encoder = JpegEncoder::new_with_quality(BufWriter::new(file), quality);
+    if let Some(profile) = icc {
+        encoder
+            .set_icc_profile(profile.to_vec())
+            .map_err(|err| err.to_string())?;
+    }
     encoder
         .write_image(
             rgb.as_raw(),
@@ -293,6 +326,19 @@ fn write_jpeg(image: &DynamicImage, path: &Path, quality: u8) -> Result<(), Stri
             rgb.height(),
             ExtendedColorType::Rgb8,
         )
+        .map_err(|err| err.to_string())
+}
+
+fn write_png(image: &DynamicImage, path: &Path, icc: Option<&[u8]>) -> Result<(), String> {
+    let file = fs::File::create(path).map_err(|err| err.to_string())?;
+    let mut encoder = image::codecs::png::PngEncoder::new(BufWriter::new(file));
+    if let Some(profile) = icc {
+        encoder
+            .set_icc_profile(profile.to_vec())
+            .map_err(|err| err.to_string())?;
+    }
+    image
+        .write_with_encoder(encoder)
         .map_err(|err| err.to_string())
 }
 
@@ -324,25 +370,39 @@ pub fn effective_encode(
     format: SourceFormat,
     has_alpha: bool,
     webp_lossless: bool,
+    allow_webp: bool,
 ) -> Result<Option<Encode>, String> {
     use crate::model::RowChoice;
-    match choice {
-        RowChoice::Skip => Ok(None),
-        RowChoice::Jpeg => Ok(Some(Encode::Jpeg)),
-        RowChoice::Png => Ok(Some(Encode::Png)),
-        RowChoice::Webp => Ok(Some(Encode::Webp(model::webp_chip_mode(
-            has_alpha,
-            webp_lossless,
-        )))),
+    let encode = match choice {
+        RowChoice::Skip => return Ok(None),
+        RowChoice::Jpeg => Encode::Jpeg,
+        RowChoice::Png => Encode::Png,
+        RowChoice::Webp => Encode::Webp(model::webp_chip_mode(has_alpha, webp_lossless)),
         RowChoice::Recommended => match recommendation.map(|rec| rec.decision) {
-            Some(Decision::Keep) => Ok(None),
-            Some(Decision::Use(encode)) => Ok(Some(encode)),
-            None => Ok(Some(match format {
+            Some(Decision::Keep) => return Ok(None),
+            Some(Decision::Use(encode)) => encode,
+            None => match format {
                 SourceFormat::Jpeg => Encode::Jpeg,
                 SourceFormat::Png => Encode::Png,
                 SourceFormat::Webp => Encode::Webp(model::webp_chip_mode(has_alpha, webp_lossless)),
-            })),
+            },
         },
+    };
+    Ok(Some(if allow_webp {
+        encode
+    } else {
+        without_webp(encode, format, has_alpha)
+    }))
+}
+
+fn without_webp(encode: Encode, format: SourceFormat, has_alpha: bool) -> Encode {
+    if !matches!(encode, Encode::Webp(_)) {
+        return encode;
+    }
+    if has_alpha || format == SourceFormat::Png {
+        Encode::Png
+    } else {
+        Encode::Jpeg
     }
 }
 
@@ -491,7 +551,7 @@ mod tests {
         let image = image::RgbaImage::from_fn(32, 32, |x, y| {
             image::Rgba([x as u8, y as u8, 40, if x < 4 { 0 } else { 255 }])
         });
-        image.save_with_format(path, ImageFormat::Png).unwrap();
+        image.save_with_format(path, image::ImageFormat::Png).unwrap();
     }
 
     fn tools() -> Option<ToolPaths> {
@@ -711,6 +771,492 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("overwrite"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn jpeg_frame(path: &Path) -> (bool, Vec<(u8, u8)>) {
+        let bytes = fs::read(path).unwrap();
+        let mut i = 0;
+        while i + 4 < bytes.len() {
+            if bytes[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = bytes[i + 1];
+            if marker == 0x00
+                || marker == 0x01
+                || marker == 0xD8
+                || marker == 0xD9
+                || (0xD0..=0xD7).contains(&marker)
+            {
+                i += 2;
+                continue;
+            }
+            if marker == 0xDA {
+                break;
+            }
+            let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+            if marker == 0xC0 || marker == 0xC2 {
+                let count = bytes[i + 9] as usize;
+                let mut samples = Vec::new();
+                let mut at = i + 10;
+                for _ in 0..count {
+                    let factor = bytes[at + 1];
+                    samples.push((factor >> 4, factor & 0x0F));
+                    at += 3;
+                }
+                return (marker == 0xC2, samples);
+            }
+            i += 2 + len;
+        }
+        panic!("JPEG has no SOF marker");
+    }
+
+    fn icc_profile(path: &Path) -> Option<Vec<u8>> {
+        let mut decoder = image::ImageReader::open(path)
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        decoder.icc_profile().ok().flatten()
+    }
+
+    fn orientation_exif() -> Vec<u8> {
+        // Little-endian TIFF, one Orientation tag, value 6 (rotate 90 CW).
+        vec![
+            0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x12, 0x01, 0x03, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]
+    }
+
+    fn insert_com(jpeg: &mut Vec<u8>, text: &str) {
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
+        let payload = text.as_bytes();
+        let mut com = vec![0xFF, 0xFE];
+        com.extend_from_slice(&(payload.len() as u16 + 2).to_be_bytes());
+        com.extend_from_slice(payload);
+        jpeg.splice(2..2, com);
+    }
+
+    fn write_marked_jpeg(
+        path: &Path,
+        width: u32,
+        height: u32,
+        quality: u8,
+        icc: &[u8],
+        exif: &[u8],
+    ) {
+        let image = image::RgbImage::from_fn(width, height, |x, y| {
+            if width != height && x < width / 2 {
+                image::Rgb([255, 0, 0])
+            } else if width != height {
+                image::Rgb([0, 0, 255])
+            } else {
+                image::Rgb([((x * 3) % 256) as u8, ((y * 5) % 256) as u8, 40])
+            }
+        });
+        let file = fs::File::create(path).unwrap();
+        let mut encoder = JpegEncoder::new_with_quality(BufWriter::new(file), quality);
+        encoder.set_icc_profile(icc.to_vec()).unwrap();
+        if !exif.is_empty() {
+            encoder.set_exif_metadata(exif.to_vec()).unwrap();
+        }
+        encoder
+            .write_image(image.as_raw(), width, height, ExtendedColorType::Rgb8)
+            .unwrap();
+        if exif.is_empty() {
+            let mut bytes = fs::read(path).unwrap();
+            insert_com(&mut bytes, "GPSLatitude secret");
+            fs::write(path, bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn email_effective_encode_never_returns_webp() {
+        use crate::model::RowChoice;
+        let webp = Encode::Webp(WebpMode::Lossy);
+        let rec = Recommendation {
+            decision: Decision::Use(webp),
+            sizes: vec![(Encode::Jpeg, 80), (webp, 40)],
+            photo: true,
+        };
+        let encode = effective_encode(
+            RowChoice::Recommended,
+            Some(&rec),
+            SourceFormat::Jpeg,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(encode, Some(Encode::Jpeg));
+        let alpha =
+            effective_encode(RowChoice::Webp, None, SourceFormat::Png, true, false, false).unwrap();
+        assert_eq!(alpha, Some(Encode::Png));
+        let fallback = effective_encode(
+            RowChoice::Recommended,
+            None,
+            SourceFormat::Webp,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(fallback, Some(Encode::Png));
+    }
+
+    #[test]
+    fn email_photo_is_a_progressive_jpeg_at_1200_and_does_not_upscale() {
+        let Some(tools) = tools() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("io-email-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let settings = crate::settings::Preset::Email.baseline();
+
+        let large = dir.join("wide.jpg");
+        let wide = image::RgbImage::from_fn(1800, 900, |x, y| {
+            image::Rgb([((x / 7) % 256) as u8, ((y / 3) % 256) as u8, 80])
+        });
+        let file = fs::File::create(&large).unwrap();
+        let encoder = JpegEncoder::new_with_quality(BufWriter::new(file), 95);
+        encoder
+            .write_image(wide.as_raw(), 1800, 900, ExtendedColorType::Rgb8)
+            .unwrap();
+        let info = analyze::analyze(&large).unwrap();
+        let out = dir.join("out-large");
+        let outcome = optimize_file(
+            &tools,
+            &settings,
+            &large,
+            &info,
+            Encode::Jpeg,
+            &out,
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.output_path.extension().and_then(|ext| ext.to_str()),
+            Some("jpg")
+        );
+        assert_eq!(
+            image::image_dimensions(&outcome.output_path).unwrap(),
+            (1200, 600)
+        );
+        assert!(
+            outcome.note.contains("resized to 1200x600"),
+            "{}",
+            outcome.note
+        );
+        let (progressive, samples) = jpeg_frame(&outcome.output_path);
+        assert!(progressive);
+        assert_eq!(samples, vec![(2, 2), (1, 1), (1, 1)]);
+        let command = outcome.commands.join(" ");
+        assert!(command.contains("--max=85"), "{command}");
+        assert!(command.contains("--all-progressive"), "{command}");
+        assert!(command.contains("--strip-exif"), "{command}");
+        assert!(command.contains("--keep-icc"), "{command}");
+        assert!(!command.contains("cwebp"), "{command}");
+        assert!(!command.contains("--strip-all"), "{command}");
+
+        let small = dir.join("small.jpg");
+        let tiny = image::RgbImage::from_fn(500, 400, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 20])
+        });
+        let file = fs::File::create(&small).unwrap();
+        let encoder = JpegEncoder::new_with_quality(BufWriter::new(file), 95);
+        encoder
+            .write_image(tiny.as_raw(), 500, 400, ExtendedColorType::Rgb8)
+            .unwrap();
+        let info = analyze::analyze(&small).unwrap();
+        let out = dir.join("out-small");
+        let outcome = optimize_file(
+            &tools,
+            &settings,
+            &small,
+            &info,
+            Encode::Jpeg,
+            &out,
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            image::image_dimensions(&outcome.output_path).unwrap(),
+            (500, 400)
+        );
+        assert!(!outcome.note.contains("resized"), "{}", outcome.note);
+        assert!(jpeg_frame(&outcome.output_path).0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn email_keeps_the_color_profile_strips_location_and_turns_the_photo_upright() {
+        let Some(tools) = tools() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("io-email-icc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let icc = b"EMAIL-ICC-PROFILE-KEEP-0123456789".to_vec();
+        let src = dir.join("sideways.jpg");
+        write_marked_jpeg(&src, 32, 16, 95, &icc, &orientation_exif());
+        let mut bytes = fs::read(&src).unwrap();
+        insert_com(&mut bytes, "GPSLatitude secret");
+        fs::write(&src, &bytes).unwrap();
+        assert!(fs::read(&src)
+            .unwrap()
+            .windows(11)
+            .any(|w| w == b"GPSLatitude"));
+        let info = analyze::analyze(&src).unwrap();
+        assert_eq!((info.width, info.height), (32, 16));
+        let out = dir.join("out");
+        let outcome = optimize_file(
+            &tools,
+            &crate::settings::Preset::Email.baseline(),
+            &src,
+            &info,
+            Encode::Jpeg,
+            &out,
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            image::image_dimensions(&outcome.output_path).unwrap(),
+            (16, 32)
+        );
+        let turned = image::open(&outcome.output_path).unwrap().to_rgb8();
+        let pixel = turned.get_pixel(8, 4).0;
+        assert!(pixel[0] > 200 && pixel[2] < 80, "{pixel:?}");
+        assert_eq!(
+            icc_profile(&outcome.output_path).as_deref(),
+            Some(icc.as_slice())
+        );
+        let output = fs::read(&outcome.output_path).unwrap();
+        assert!(!output.windows(11).any(|w| w == b"GPSLatitude"));
+        let mut decoder = image::ImageReader::open(&outcome.output_path)
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        assert_eq!(
+            decoder.orientation().unwrap(),
+            image::metadata::Orientation::NoTransforms
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_keeps_icc_when_jpegoptim_sees_the_original() {
+        let Some(tools) = tools() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("io-strip-icc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let icc = b"EMAIL-ICC-PROFILE-KEEP-0123456789".to_vec();
+        let src = dir.join("photo.jpg");
+        write_marked_jpeg(&src, 48, 48, 95, &icc, &[]);
+        assert!(fs::read(&src)
+            .unwrap()
+            .windows(11)
+            .any(|w| w == b"GPSLatitude"));
+        let settings = Settings {
+            strip_metadata: true,
+            ..Settings::default()
+        };
+        let info = analyze::analyze(&src).unwrap();
+        let out = dir.join("out");
+        let outcome = optimize_file(
+            &tools,
+            &settings,
+            &src,
+            &info,
+            Encode::Jpeg,
+            &out,
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            icc_profile(&outcome.output_path).as_deref(),
+            Some(icc.as_slice())
+        );
+        assert!(!fs::read(&outcome.output_path)
+            .unwrap()
+            .windows(11)
+            .any(|w| w == b"GPSLatitude"));
+        let command = outcome.commands.join(" ");
+        assert!(command.contains("--keep-icc"), "{command}");
+        assert!(!command.contains("--strip-icc"), "{command}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn png_crc(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    fn insert_png_text(png: &mut Vec<u8>, keyword: &str, text: &str) {
+        let iend = png.windows(4).position(|window| window == b"IEND").unwrap();
+        let mut data = Vec::new();
+        data.extend(keyword.as_bytes());
+        data.push(0);
+        data.extend(text.as_bytes());
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        chunk.extend(b"tEXt");
+        chunk.extend(&data);
+        let crc = png_crc(&chunk[4..]);
+        chunk.extend_from_slice(&crc.to_be_bytes());
+        png.splice(iend - 4..iend - 4, chunk);
+    }
+
+    #[test]
+    fn email_transparency_stays_png_and_never_considers_webp() {
+        let Some(tools) = tools() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("io-email-png-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let icc = fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/fixtures/srgb.icc"))
+            .unwrap();
+        let src = dir.join("badge.png");
+        // Large flat areas: lossless WebP beats pngcrush by much more than 8%.
+        let image = image::RgbaImage::from_fn(900, 600, |x, y| {
+            let clear = x < 40;
+            let block = (200..500).contains(&x) && (80..400).contains(&y);
+            let rgb = if block { [240, 80, 40] } else { [30, 90, 200] };
+            image::Rgba([rgb[0], rgb[1], rgb[2], if clear { 0 } else { 255 }])
+        });
+        let file = fs::File::create(&src).unwrap();
+        let mut encoder = image::codecs::png::PngEncoder::new(BufWriter::new(file));
+        encoder.set_icc_profile(icc.clone()).unwrap();
+        image::DynamicImage::ImageRgba8(image)
+            .write_with_encoder(encoder)
+            .unwrap();
+        let mut bytes = fs::read(&src).unwrap();
+        insert_png_text(&mut bytes, "Comment", "GPSLatitude secret");
+        fs::write(&src, &bytes).unwrap();
+        let info = analyze::analyze(&src).unwrap();
+        assert!(info.has_alpha);
+
+        let email = crate::settings::Preset::Email.baseline();
+        let plain = Settings::default();
+        let email_rec = recommend_file(&tools, &email, &src, &info, &CancelFlag::new()).unwrap();
+        let plain_rec = recommend_file(&tools, &plain, &src, &info, &CancelFlag::new()).unwrap();
+        assert!(plain_rec
+            .sizes
+            .iter()
+            .any(|(encode, _)| matches!(encode, Encode::Webp(_))));
+        assert!(email_rec
+            .sizes
+            .iter()
+            .all(|(encode, _)| !matches!(encode, Encode::Webp(_))));
+        assert_eq!(
+            plain_rec.decision,
+            Decision::Use(Encode::Webp(WebpMode::Lossless)),
+            "transparency fixture should favor WebP: {:?}",
+            plain_rec.sizes
+        );
+        assert!(!matches!(
+            email_rec.decision,
+            Decision::Use(Encode::Webp(_))
+        ));
+        assert!(matches!(
+            email_rec.decision,
+            Decision::Use(Encode::Png) | Decision::Keep
+        ));
+
+        let photo = dir.join("noise.jpg");
+        let noise = image::RgbImage::from_fn(96, 96, |x, y| {
+            image::Rgb([((x * 17 + y * 9) % 256) as u8, (x * 3) as u8, (y * 5) as u8])
+        });
+        let file = fs::File::create(&photo).unwrap();
+        let encoder = JpegEncoder::new_with_quality(BufWriter::new(file), 95);
+        encoder
+            .write_image(noise.as_raw(), 96, 96, ExtendedColorType::Rgb8)
+            .unwrap();
+        let photo_info = analyze::analyze(&photo).unwrap();
+        let email_photo =
+            recommend_file(&tools, &email, &photo, &photo_info, &CancelFlag::new()).unwrap();
+        let plain_photo =
+            recommend_file(&tools, &plain, &photo, &photo_info, &CancelFlag::new()).unwrap();
+        assert!(plain_photo
+            .sizes
+            .iter()
+            .any(|(encode, _)| matches!(encode, Encode::Webp(_))));
+        assert!(email_photo
+            .sizes
+            .iter()
+            .all(|(encode, _)| !matches!(encode, Encode::Webp(_))));
+        assert!(matches!(
+            email_photo.decision,
+            Decision::Keep | Decision::Use(Encode::Jpeg)
+        ));
+        let webp_bytes = plain_photo
+            .sizes
+            .iter()
+            .find_map(|(encode, bytes)| matches!(encode, Encode::Webp(_)).then_some(*bytes))
+            .expect("default compare includes WebP");
+        let jpeg_bytes = plain_photo
+            .sizes
+            .iter()
+            .find_map(|(encode, bytes)| (*encode == Encode::Jpeg).then_some(*bytes))
+            .expect("default compare includes JPEG");
+        assert!(
+            webp_bytes * 100 + jpeg_bytes * 8 <= jpeg_bytes * 100,
+            "fixture should favor WebP: webp {webp_bytes} jpeg {jpeg_bytes}"
+        );
+        assert_eq!(
+            plain_photo.decision,
+            Decision::Use(Encode::Webp(WebpMode::Lossy))
+        );
+        assert!(matches!(
+            email_photo.decision,
+            Decision::Keep | Decision::Use(Encode::Jpeg)
+        ));
+
+        let out = dir.join("png-out");
+        let outcome = optimize_file(
+            &tools,
+            &email,
+            &src,
+            &info,
+            Encode::Png,
+            &out,
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.output_path.extension().and_then(|ext| ext.to_str()),
+            Some("png")
+        );
+        assert!(!outcome
+            .commands
+            .iter()
+            .any(|cmd| cmd.contains("-brute") || cmd.contains("cwebp")));
+        assert!(outcome.commands.iter().any(|cmd| cmd.contains("-reduce")));
+        let output = fs::read(&outcome.output_path).unwrap();
+        assert!(!output.windows(11).any(|window| window == b"GPSLatitude"));
+        assert_eq!(
+            icc_profile(&outcome.output_path).as_deref(),
+            Some(icc.as_slice())
+        );
+        let decoded = image::open(&outcome.output_path).unwrap().to_rgba8();
+        assert!(decoded.pixels().any(|pixel| pixel[3] == 0));
+        assert!(std::fs::read_dir(&out).unwrap().all(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_none_or(|ext| ext != "webp")
+        }));
         let _ = fs::remove_dir_all(&dir);
     }
 }

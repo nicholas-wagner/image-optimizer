@@ -180,6 +180,7 @@ pub fn encodes_for(
     width: u32,
     height: u32,
     webp_lossless: bool,
+    allow_webp: bool,
 ) -> (bool, Vec<Encode>) {
     let photo = saves_as_jpeg(format, has_alpha, color_count, width, height);
     // Small art (and anything with alpha) is compared as lossless WebP.
@@ -192,10 +193,12 @@ pub fn encodes_for(
     let mut encodes = Vec::new();
     if photo {
         encodes.push(Encode::Jpeg);
-    } else if format == SourceFormat::Png || has_alpha {
+    } else if format == SourceFormat::Png || has_alpha || !allow_webp {
         encodes.push(Encode::Png);
     }
-    encodes.push(Encode::Webp(webp_mode));
+    if allow_webp {
+        encodes.push(Encode::Webp(webp_mode));
+    }
     (photo, encodes)
 }
 
@@ -350,7 +353,8 @@ mod tests {
 
     #[test]
     fn graphics_request_png_and_lossless_webp() {
-        let (photo, encodes) = encodes_for(SourceFormat::Png, true, Some(10), 2000, 2000, false);
+        let (photo, encodes) =
+            encodes_for(SourceFormat::Png, true, Some(10), 2000, 2000, false, true);
         assert!(!photo);
         assert_eq!(
             encodes,
@@ -361,7 +365,7 @@ mod tests {
     #[test]
     fn small_art_stays_png_and_large_art_saves_as_jpeg() {
         let (small, small_encodes) =
-            encodes_for(SourceFormat::Png, false, Some(40), 256, 256, false);
+            encodes_for(SourceFormat::Png, false, Some(40), 256, 256, false, true);
         assert!(!small);
         assert_eq!(
             small_encodes,
@@ -369,7 +373,7 @@ mod tests {
         );
 
         let (large, large_encodes) =
-            encodes_for(SourceFormat::Png, false, Some(40), 1600, 900, false);
+            encodes_for(SourceFormat::Png, false, Some(40), 1600, 900, false, true);
         assert!(large);
         assert_eq!(
             large_encodes,
@@ -393,8 +397,52 @@ mod tests {
     }
 
     #[test]
+    fn email_never_requests_webp_even_when_webp_would_win() {
+        let (photo, encodes) =
+            encodes_for(SourceFormat::Jpeg, false, None, 4000, 3000, false, false);
+        assert!(photo);
+        assert_eq!(encodes, vec![Encode::Jpeg]);
+
+        let (graphic, graphic_encodes) =
+            encodes_for(SourceFormat::Png, false, Some(40), 256, 256, false, false);
+        assert!(!graphic);
+        assert_eq!(graphic_encodes, vec![Encode::Png]);
+
+        let (alpha, alpha_encodes) =
+            encodes_for(SourceFormat::Png, true, Some(10), 2000, 2000, false, false);
+        assert!(!alpha);
+        assert_eq!(alpha_encodes, vec![Encode::Png]);
+
+        let (opaque_webp, webp_encodes) =
+            encodes_for(SourceFormat::Webp, false, Some(16), 400, 300, false, false);
+        assert!(!opaque_webp);
+        assert_eq!(webp_encodes, vec![Encode::Png]);
+
+        // The same bytes pick WebP when it is a candidate, and JPEG or PNG when it is not.
+        let source = 1000u64;
+        let with_webp = [(Encode::Jpeg, 800), (Encode::Webp(WebpMode::Lossy), 500)];
+        assert_eq!(
+            pick(source, true, &with_webp),
+            Decision::Use(Encode::Webp(WebpMode::Lossy))
+        );
+        assert_eq!(
+            pick(source, true, &[(Encode::Jpeg, 800)]),
+            Decision::Use(Encode::Jpeg)
+        );
+        let graphic_webp = [(Encode::Png, 700), (Encode::Webp(WebpMode::Lossless), 400)];
+        assert_eq!(
+            pick(source, false, &graphic_webp),
+            Decision::Use(Encode::Webp(WebpMode::Lossless))
+        );
+        assert_eq!(
+            pick(source, false, &[(Encode::Png, 700)]),
+            Decision::Use(Encode::Png)
+        );
+    }
+
+    #[test]
     fn photos_request_jpeg_and_lossy_webp() {
-        let (photo, encodes) = encodes_for(SourceFormat::Jpeg, false, None, 400, 300, false);
+        let (photo, encodes) = encodes_for(SourceFormat::Jpeg, false, None, 400, 300, false, true);
         assert!(photo);
         assert_eq!(
             encodes,
