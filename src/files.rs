@@ -72,7 +72,9 @@ pub fn shortcuts() -> Vec<(&'static str, PathBuf)> {
 }
 
 pub fn parent_dir(path: &Path) -> Option<PathBuf> {
-    path.parent().filter(|parent| *parent != path).map(Path::to_path_buf)
+    path.parent()
+        .filter(|parent| *parent != path)
+        .map(Path::to_path_buf)
 }
 
 pub fn list_dir(dir: &Path) -> Result<Vec<DirItem>, String> {
@@ -178,10 +180,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "io-files-{name}-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("io-files-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
