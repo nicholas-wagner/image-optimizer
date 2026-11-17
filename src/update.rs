@@ -28,7 +28,10 @@ pub enum Install {
 }
 
 pub fn is_newer_than_running(version: &str) -> bool {
-    match (parse_version(version), parse_version(env!("CARGO_PKG_VERSION"))) {
+    match (
+        parse_version(version),
+        parse_version(env!("CARGO_PKG_VERSION")),
+    ) {
         (Some(latest), Some(current)) => latest > current,
         _ => false,
     }

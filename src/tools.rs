@@ -60,14 +60,18 @@ pub fn locate() -> Result<ToolPaths, String> {
     }
     #[cfg(not(embed_tools))]
     {
-        Err("jpegoptim, pngcrush, and cwebp were not found in bin/. Run scripts/build-tools.sh".into())
+        Err(
+            "jpegoptim, pngcrush, and cwebp were not found in bin/. Run scripts/build-tools.sh"
+                .into(),
+        )
     }
 }
 
 #[allow(dead_code)]
 pub fn cache_bin_dir() -> Result<PathBuf, String> {
     let dir = if cfg!(windows) {
-        let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| std::env::temp_dir().display().to_string());
+        let base = std::env::var("LOCALAPPDATA")
+            .unwrap_or_else(|_| std::env::temp_dir().display().to_string());
         PathBuf::from(base).join("image-optimizer").join("bin")
     } else if cfg!(target_os = "macos") {
         let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
@@ -88,16 +92,32 @@ pub fn cache_bin_dir() -> Result<PathBuf, String> {
 
 #[cfg(all(embed_tools, windows_tools))]
 fn install_embedded(dir: &Path) -> Result<(), String> {
-    install_tool(dir, &exe_name("jpegoptim"), include_bytes!("../bin/jpegoptim.exe"))?;
-    install_tool(dir, &exe_name("pngcrush"), include_bytes!("../bin/pngcrush.exe"))?;
+    install_tool(
+        dir,
+        &exe_name("jpegoptim"),
+        include_bytes!("../bin/jpegoptim.exe"),
+    )?;
+    install_tool(
+        dir,
+        &exe_name("pngcrush"),
+        include_bytes!("../bin/pngcrush.exe"),
+    )?;
     install_tool(dir, &exe_name("cwebp"), include_bytes!("../bin/cwebp.exe"))?;
     Ok(())
 }
 
 #[cfg(all(embed_tools, not(windows_tools)))]
 fn install_embedded(dir: &Path) -> Result<(), String> {
-    install_tool(dir, &exe_name("jpegoptim"), include_bytes!("../bin/jpegoptim"))?;
-    install_tool(dir, &exe_name("pngcrush"), include_bytes!("../bin/pngcrush"))?;
+    install_tool(
+        dir,
+        &exe_name("jpegoptim"),
+        include_bytes!("../bin/jpegoptim"),
+    )?;
+    install_tool(
+        dir,
+        &exe_name("pngcrush"),
+        include_bytes!("../bin/pngcrush"),
+    )?;
     install_tool(dir, &exe_name("cwebp"), include_bytes!("../bin/cwebp"))?;
     Ok(())
 }
@@ -131,7 +151,9 @@ fn make_executable(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(path).map_err(|err| err.to_string())?.permissions();
+        let mut perms = fs::metadata(path)
+            .map_err(|err| err.to_string())?
+            .permissions();
         perms.set_mode(0o755);
         fs::set_permissions(path, perms).map_err(|err| err.to_string())?;
     }

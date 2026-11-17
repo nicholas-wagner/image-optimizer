@@ -7,7 +7,7 @@
 use crate::analyze::{self, ImageInfo};
 use crate::commands::{self, display_command};
 use crate::model::{self, Decision, Encode, Recommendation, SourceFormat, WebpMode};
-use crate::settings::Settings;
+use crate::settings::{self, Settings};
 use crate::tools::ToolPaths;
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder};
@@ -37,7 +37,11 @@ impl CancelFlag {
 
     pub fn cancel(&self) {
         self.flag.store(true, Ordering::Relaxed);
-        let pids = self.pids.lock().map(|guard| guard.clone()).unwrap_or_default();
+        let pids = self
+            .pids
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
         for pid in pids {
             kill_pid(pid);
         }
@@ -122,7 +126,7 @@ pub fn recommend_file(
         let outcome = encode_one(tools, settings, src, info, encode, &out_dir, cancel)?;
         sizes.push((encode, outcome.output_bytes));
     }
-    let decision = model::pick(info.bytes, photo, &sizes);
+    let decision = model::pick(info.bytes, photo, &sizes, settings.max_file_bytes());
     Ok(Recommendation {
         decision,
         sizes,
@@ -184,8 +188,26 @@ fn encode_one(
         return Err("Refusing to overwrite the original".to_string());
     }
     let scratch = Scratch::new("encode")?;
+    if let Some(limit) = settings.max_file_bytes() {
+        if final_path.exists() {
+            fs::remove_file(&final_path).map_err(|err| err.to_string())?;
+        }
+        return encode_under(
+            &EncodeJob {
+                tools,
+                settings,
+                src,
+                info,
+                encode,
+                scratch: &scratch,
+                cancel,
+            },
+            &final_path,
+            limit,
+        );
+    }
     let mut note = String::new();
-    let input = materialize_input(src, info, settings, encode, &scratch, &mut note)?;
+    let input = materialize_input(src, info, settings, encode, &scratch, None, &mut note)?;
     if same_file(src, &final_path) {
         return Err("Refusing to overwrite the original".to_string());
     }
@@ -202,7 +224,14 @@ fn encode_one(
             commands.push(display_command(&tools.jpegoptim, &args));
             run_tool(cancel, &tools.jpegoptim, &args)?;
             let produced = staging.join(input.file_name().unwrap_or_default());
-            copy_file(if produced.is_file() { &produced } else { &input }, &final_path)?
+            copy_file(
+                if produced.is_file() {
+                    &produced
+                } else {
+                    &input
+                },
+                &final_path,
+            )?
         }
         Encode::Png => {
             let args = commands::pngcrush_args(settings, &input, &final_path);
@@ -228,16 +257,294 @@ fn encode_one(
     })
 }
 
+/// Stop if a bug keeps producing the same long side.
+const MAX_SIZE_ATTEMPTS: u32 = 24;
+
+struct Produced {
+    path: PathBuf,
+    bytes: u64,
+    width: u32,
+    height: u32,
+    commands: Vec<String>,
+    note: String,
+}
+
+struct ToolRun {
+    path: PathBuf,
+    bytes: u64,
+    commands: Vec<String>,
+}
+
+fn push_note(note: &mut String, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if !note.is_empty() {
+        note.push_str("; ");
+    }
+    note.push_str(text);
+}
+
+/// The size tool can undershoot the quality floor. A result more than about
+/// 5% smaller than the floor encode got there by going below that quality.
+fn meets_quality_floor(sized: u64, floor_bytes: u64) -> bool {
+    sized >= floor_bytes.saturating_sub(floor_bytes / 20)
+}
+
+struct EncodeJob<'a> {
+    tools: &'a ToolPaths,
+    settings: &'a Settings,
+    src: &'a Path,
+    info: &'a ImageInfo,
+    encode: Encode,
+    scratch: &'a Scratch,
+    cancel: &'a CancelFlag,
+}
+
+fn encode_under(
+    job: &EncodeJob<'_>,
+    final_path: &Path,
+    limit: u64,
+) -> Result<OptimizeOutcome, String> {
+    let mut edge = if job.settings.resize_enabled {
+        Some(job.settings.resize_max_edge.max(1))
+    } else {
+        None
+    };
+    let mut best: Option<Produced> = None;
+    for step in 0..MAX_SIZE_ATTEMPTS {
+        if job.cancel.is_cancelled() {
+            return Err("Cancelled".to_string());
+        }
+        let produced = encode_attempt(job, edge, step, limit)?;
+        let dims = (produced.width, produced.height);
+        let bytes = produced.bytes;
+        if bytes <= limit {
+            best = Some(produced);
+            break;
+        }
+        if best.as_ref().map(|item| bytes < item.bytes).unwrap_or(true) {
+            best = Some(produced);
+        }
+        edge = match settings::next_long_edge(dims.0, dims.1) {
+            Some(next) => Some(next),
+            None => break,
+        };
+    }
+    let best = best.ok_or_else(|| "no output file".to_string())?;
+    let bytes = copy_file(&best.path, final_path)?;
+    let mut note = best.note;
+    let fit = if bytes <= limit {
+        settings::fits_note(job.settings.max_file_kb)
+    } else {
+        settings::missed_fit_note(job.settings.max_file_kb)
+    };
+    push_note(&mut note, &fit);
+    Ok(OptimizeOutcome {
+        output_path: final_path.to_path_buf(),
+        output_bytes: bytes,
+        commands: best.commands,
+        note,
+    })
+}
+
+fn encode_attempt(
+    job: &EncodeJob<'_>,
+    edge: Option<u32>,
+    step: u32,
+    limit: u64,
+) -> Result<Produced, String> {
+    let dir = job.scratch.path.join(format!("step-{step}"));
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let mut note = String::new();
+    let input = materialize_input(
+        job.src,
+        job.info,
+        job.settings,
+        job.encode,
+        job.scratch,
+        edge,
+        &mut note,
+    )?;
+    let run = match job.encode {
+        Encode::Jpeg if !job.settings.jpeg_lossless => {
+            fit_lossy_jpeg(job.tools, job.settings, &input, &dir, limit, job.cancel)?
+        }
+        Encode::Webp(WebpMode::Lossy) => {
+            fit_lossy_webp(job.tools, job.settings, &input, &dir, limit, job.cancel)?
+        }
+        _ => run_standard(
+            job.tools,
+            job.settings,
+            job.encode,
+            &input,
+            &dir,
+            job.cancel,
+        )?,
+    };
+    let (width, height) =
+        image::image_dimensions(&run.path).unwrap_or((job.info.width, job.info.height));
+    Ok(Produced {
+        path: run.path,
+        bytes: run.bytes,
+        width,
+        height,
+        commands: run.commands,
+        note,
+    })
+}
+
+fn fit_lossy_jpeg(
+    tools: &ToolPaths,
+    settings: &Settings,
+    input: &Path,
+    dir: &Path,
+    limit: u64,
+    cancel: &CancelFlag,
+) -> Result<ToolRun, String> {
+    let cap = settings.jpeg_quality.min(100);
+    let floor = settings.lossy_floor(cap);
+    let cap_dir = dir.join("cap");
+    let cap_args = commands::jpegoptim_at_quality(settings, input, &cap_dir, cap);
+    let capped = run_jpeg(tools, cancel, &cap_args, input, &cap_dir)?;
+    if capped.bytes <= limit || floor == cap {
+        return Ok(capped);
+    }
+    let sized_dir = dir.join("sized");
+    let sized_args = commands::jpegoptim_args(settings, input, &sized_dir);
+    let sized = run_jpeg(tools, cancel, &sized_args, input, &sized_dir)?;
+    let floor_dir = dir.join("floor");
+    let floor_args = commands::jpegoptim_at_quality(settings, input, &floor_dir, floor);
+    let floor_run = run_jpeg(tools, cancel, &floor_args, input, &floor_dir)?;
+    if sized.bytes <= limit && meets_quality_floor(sized.bytes, floor_run.bytes) {
+        Ok(sized)
+    } else {
+        Ok(floor_run)
+    }
+}
+
+fn fit_lossy_webp(
+    tools: &ToolPaths,
+    settings: &Settings,
+    input: &Path,
+    dir: &Path,
+    limit: u64,
+    cancel: &CancelFlag,
+) -> Result<ToolRun, String> {
+    let cap = settings.webp_quality.min(100);
+    let floor = settings.lossy_floor(cap);
+    let cap_path = dir.join("cap.webp");
+    let cap_args = commands::cwebp_at_quality(settings, input, &cap_path, cap);
+    let capped = run_webp(tools, cancel, &cap_args, &cap_path)?;
+    if capped.bytes <= limit || floor == cap {
+        return Ok(capped);
+    }
+    let sized_path = dir.join("sized.webp");
+    let sized_args = commands::cwebp_args(settings, WebpMode::Lossy, input, &sized_path);
+    let sized = run_webp(tools, cancel, &sized_args, &sized_path)?;
+    let floor_path = dir.join("floor.webp");
+    let floor_args = commands::cwebp_at_quality(settings, input, &floor_path, floor);
+    let floor_run = run_webp(tools, cancel, &floor_args, &floor_path)?;
+    if sized.bytes <= limit && meets_quality_floor(sized.bytes, floor_run.bytes) {
+        Ok(sized)
+    } else {
+        Ok(floor_run)
+    }
+}
+
+fn run_standard(
+    tools: &ToolPaths,
+    settings: &Settings,
+    encode: Encode,
+    input: &Path,
+    dir: &Path,
+    cancel: &CancelFlag,
+) -> Result<ToolRun, String> {
+    match encode {
+        Encode::Jpeg => {
+            let staging = dir.join("jpeg");
+            let args = commands::jpegoptim_args(settings, input, &staging);
+            run_jpeg(tools, cancel, &args, input, &staging)
+        }
+        Encode::Png => {
+            let dest = dir.join("result.png");
+            let args = commands::pngcrush_args(settings, input, &dest);
+            let command = display_command(&tools.pngcrush, &args);
+            run_tool(cancel, &tools.pngcrush, &args)?;
+            Ok(ToolRun {
+                bytes: file_len(&dest)?,
+                path: dest,
+                commands: vec![command],
+            })
+        }
+        Encode::Webp(mode) => {
+            let dest = dir.join("result.webp");
+            let args = commands::cwebp_args(settings, mode, input, &dest);
+            run_webp(tools, cancel, &args, &dest)
+        }
+    }
+}
+
+fn run_jpeg(
+    tools: &ToolPaths,
+    cancel: &CancelFlag,
+    args: &[String],
+    input: &Path,
+    staging: &Path,
+) -> Result<ToolRun, String> {
+    fs::create_dir_all(staging).map_err(|err| err.to_string())?;
+    let command = display_command(&tools.jpegoptim, args);
+    run_tool(cancel, &tools.jpegoptim, args)?;
+    let produced = staging.join(input.file_name().unwrap_or_default());
+    let source = if produced.is_file() {
+        produced
+    } else {
+        input.to_path_buf()
+    };
+    let dest = staging.join("result.jpg");
+    let bytes = if source == dest {
+        file_len(&dest)?
+    } else {
+        copy_file(&source, &dest)?
+    };
+    Ok(ToolRun {
+        path: dest,
+        bytes,
+        commands: vec![command],
+    })
+}
+
+fn run_webp(
+    tools: &ToolPaths,
+    cancel: &CancelFlag,
+    args: &[String],
+    dest: &Path,
+) -> Result<ToolRun, String> {
+    let command = display_command(&tools.cwebp, args);
+    run_tool(cancel, &tools.cwebp, args)?;
+    Ok(ToolRun {
+        bytes: file_len(dest)?,
+        path: dest.to_path_buf(),
+        commands: vec![command],
+    })
+}
+
 fn materialize_input(
     src: &Path,
     info: &ImageInfo,
     settings: &Settings,
     encode: Encode,
     scratch: &Scratch,
+    edge: Option<u32>,
     note: &mut String,
 ) -> Result<PathBuf, String> {
-    let resize = settings.resize_enabled;
-    let pass_through = !resize
+    // `Some` is a forced long side (the size loop). `None` keeps the resize checkbox.
+    let resize_edge = match edge {
+        Some(edge) => Some(edge.max(1)),
+        None if settings.resize_enabled => Some(settings.resize_max_edge),
+        None => None,
+    };
+    let pass_through = resize_edge.is_none()
         && match encode {
             Encode::Jpeg => info.format == SourceFormat::Jpeg,
             Encode::Png => info.format == SourceFormat::Png,
@@ -249,10 +556,10 @@ fn materialize_input(
 
     let (image, profile) = load_image(src)?;
     let (width, height) = (image.width(), image.height());
-    let image = if resize {
-        let (nw, nh) = model::fit(width, height, settings.resize_max_edge);
+    let image = if let Some(edge) = resize_edge {
+        let (nw, nh) = model::fit(width, height, edge);
         if nw != width || nh != height {
-            note.push_str(&format!("resized to {nw}x{nh}"));
+            push_note(note, &format!("resized to {nw}x{nh}"));
             image.resize(nw, nh, image::imageops::FilterType::Lanczos3)
         } else {
             image
@@ -264,10 +571,7 @@ fn materialize_input(
     match encode {
         Encode::Jpeg => {
             if image.color().has_alpha() {
-                if !note.is_empty() {
-                    note.push_str("; ");
-                }
-                note.push_str("alpha flattened onto white");
+                push_note(note, "alpha flattened onto white");
             }
             let path = scratch.path.join("input.jpg");
             write_jpeg(&image, &path, 100, profile.as_deref())?;
@@ -467,9 +771,9 @@ fn run_tool(cancel: &CancelFlag, program: &Path, args: &[String]) -> Result<(), 
             cmd.env("LD_LIBRARY_PATH", joined);
         }
     }
-    let child = cmd.spawn().map_err(|err| {
-        format!("failed to start {}: {err}", program.display())
-    })?;
+    let child = cmd
+        .spawn()
+        .map_err(|err| format!("failed to start {}: {err}", program.display()))?;
     let pid = child.id();
     if let Ok(mut pids) = cancel.pids.lock() {
         pids.push(pid);
@@ -491,7 +795,10 @@ fn run_tool(cancel: &CancelFlag, program: &Path, args: &[String]) -> Result<(), 
     let clipped: String = detail.chars().take(400).collect();
     Err(format!(
         "{} exited {} {}",
-        program.file_name().and_then(|n| n.to_str()).unwrap_or("tool"),
+        program
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("tool"),
         output.status,
         clipped
     ))
@@ -551,7 +858,9 @@ mod tests {
         let image = image::RgbaImage::from_fn(32, 32, |x, y| {
             image::Rgba([x as u8, y as u8, 40, if x < 4 { 0 } else { 255 }])
         });
-        image.save_with_format(path, image::ImageFormat::Png).unwrap();
+        image
+            .save_with_format(path, image::ImageFormat::Png)
+            .unwrap();
     }
 
     fn tools() -> Option<ToolPaths> {
@@ -619,7 +928,10 @@ mod tests {
             &CancelFlag::new(),
         )
         .unwrap();
-        assert_eq!(jpeg_sampling(&outcome.output_path), vec![(2, 2), (1, 1), (1, 1)]);
+        assert_eq!(
+            jpeg_sampling(&outcome.output_path),
+            vec![(2, 2), (1, 1), (1, 1)]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1257,6 +1569,265 @@ mod tests {
                 .extension()
                 .is_none_or(|ext| ext != "webp")
         }));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn write_rgb(
+        path: &Path,
+        width: u32,
+        height: u32,
+        quality: u8,
+        pixel: impl Fn(u32, u32) -> image::Rgb<u8>,
+    ) {
+        let image = image::RgbImage::from_fn(width, height, pixel);
+        let file = fs::File::create(path).unwrap();
+        let encoder = JpegEncoder::new_with_quality(BufWriter::new(file), quality);
+        encoder
+            .write_image(image.as_raw(), width, height, ExtendedColorType::Rgb8)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_large_jpeg_fits_under_one_megabyte_without_dropping_below_the_floor() {
+        let Some(tools) = tools() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("io-fit-jpeg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("photo.jpg");
+        // High-frequency color. Quality 90 stays over 1 MB; quality 60 fits.
+        write_rgb(&src, 2000, 1400, 95, |x, y| {
+            let n = x
+                .wrapping_mul(13)
+                .wrapping_add(y.wrapping_mul(29))
+                .wrapping_mul(x ^ y.wrapping_add(3));
+            image::Rgb([
+                (n & 255) as u8,
+                ((n >> 8) & 255) as u8,
+                ((n >> 16) & 255) as u8,
+            ])
+        });
+        let before = fs::read(&src).unwrap();
+        let info = analyze::analyze(&src).unwrap();
+        assert!(info.bytes > 1024 * 1024, "fixture should start over 1 MB");
+        let plain = optimize_file(
+            &tools,
+            &Settings::default(),
+            &src,
+            &info,
+            Encode::Jpeg,
+            &dir.join("plain"),
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert!(
+            plain.output_bytes > 1024 * 1024,
+            "quality 90 should still miss 1 MB, was {}",
+            plain.output_bytes
+        );
+        let mut settings = Settings::default();
+        settings.max_file_kb = 1024;
+        let outcome = optimize_file(
+            &tools,
+            &settings,
+            &src,
+            &info,
+            Encode::Jpeg,
+            &dir.join("out"),
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&src).unwrap(), before);
+        assert!(
+            outcome.output_bytes <= 1024 * 1024,
+            "{}",
+            outcome.output_bytes
+        );
+        assert!(outcome.note.contains("fits under 1 MB"), "{}", outcome.note);
+        let (width, height) = image::image_dimensions(&outcome.output_path).unwrap();
+        let long = width.max(height);
+        assert!(
+            (1000..=2000).contains(&long),
+            "stayed at or above 1000 px: {width}x{height}"
+        );
+        let floor = Settings {
+            jpeg_quality: 60,
+            max_file_kb: 0,
+            resize_enabled: long < info.width.max(info.height),
+            resize_max_edge: long,
+            ..Settings::default()
+        };
+        let floor_out = optimize_file(
+            &tools,
+            &floor,
+            &src,
+            &info,
+            Encode::Jpeg,
+            &dir.join("floor"),
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert!(
+            outcome.output_bytes + outcome.output_bytes / 20 >= floor_out.output_bytes,
+            "result {} went below the quality-60 file {}",
+            outcome.output_bytes,
+            floor_out.output_bytes
+        );
+        let command = outcome.commands.join(" ");
+        assert!(
+            command.contains("--size=") || command.contains("--max="),
+            "{command}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_large_png_fits_under_one_megabyte_by_shrinking() {
+        let Some(tools) = tools() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("io-fit-png-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("drawing.png");
+        // Smooth color plus a little grain. At full size pngcrush stays over 1 MB.
+        // One shorter long side gets under it, and stays above 1000 px.
+        let image = image::RgbImage::from_fn(2200, 1500, |x, y| {
+            let xf = x as f32 / 2200.0;
+            let yf = y as f32 / 1500.0;
+            let mut v = 128.0
+                + 40.0 * (xf * 90.0).sin()
+                + 30.0 * (yf * 70.0).sin()
+                + 20.0 * ((xf + yf) * 110.0).sin();
+            let n =
+                (x.wrapping_mul(17).wrapping_add(y.wrapping_mul(13)) ^ x.wrapping_mul(y)) & 0xff;
+            v += ((n as i32) % 8 - 4) as f32;
+            let v = v.round().clamp(0.0, 255.0) as u8;
+            image::Rgb([v, v.saturating_add(20), 255 - v])
+        });
+        image
+            .save_with_format(&src, image::ImageFormat::Png)
+            .unwrap();
+        let before = fs::read(&src).unwrap();
+        let info = analyze::analyze(&src).unwrap();
+        assert!(
+            info.bytes > 1024 * 1024,
+            "fixture should start over 1 MB, was {}",
+            info.bytes
+        );
+        let mut settings = Settings::default();
+        settings.max_file_kb = 1024;
+        let outcome = optimize_file(
+            &tools,
+            &settings,
+            &src,
+            &info,
+            Encode::Png,
+            &dir.join("out"),
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&src).unwrap(), before);
+        assert!(
+            outcome.output_bytes <= 1024 * 1024,
+            "{}",
+            outcome.output_bytes
+        );
+        assert!(outcome.note.contains("fits under 1 MB"), "{}", outcome.note);
+        assert!(outcome.note.contains("resized to"), "{}", outcome.note);
+        let (width, height) = image::image_dimensions(&outcome.output_path).unwrap();
+        let long = width.max(height);
+        assert!(
+            long < info.width.max(info.height),
+            "{width}x{height} {}",
+            outcome.output_bytes
+        );
+        assert!(long >= 1000, "{width}x{height}");
+        assert_eq!(
+            outcome.output_path.extension().and_then(|ext| ext.to_str()),
+            Some("png")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_impossible_target_keeps_the_smallest_honest_version() {
+        let Some(tools) = tools() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("io-fit-miss-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("noise.png");
+        // Full RGB noise does not compress. At 1000 px it is still well over 500 KB.
+        let image = image::RgbImage::from_fn(1200, 900, |x, y| {
+            let n = x
+                .wrapping_mul(1103515245)
+                .wrapping_add(y.wrapping_mul(12345))
+                .wrapping_mul(x ^ y.wrapping_add(9));
+            image::Rgb([
+                (n & 255) as u8,
+                ((n >> 8) & 255) as u8,
+                ((n >> 16) & 255) as u8,
+            ])
+        });
+        image
+            .save_with_format(&src, image::ImageFormat::Png)
+            .unwrap();
+        let before = fs::read(&src).unwrap();
+        let info = analyze::analyze(&src).unwrap();
+        let mut settings = Settings::default();
+        settings.max_file_kb = 500;
+        let outcome = optimize_file(
+            &tools,
+            &settings,
+            &src,
+            &info,
+            Encode::Png,
+            &dir.join("out"),
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&src).unwrap(), before);
+        assert!(outcome.output_path.is_file());
+        assert!(
+            outcome.output_bytes > 500 * 1024,
+            "{}",
+            outcome.output_bytes
+        );
+        assert!(outcome.output_bytes < info.bytes, "kept a smaller copy");
+        assert!(
+            outcome.note.contains(
+                "Couldn't get under 500 KB without going below 1000 px, saved the smallest version"
+            ),
+            "{}",
+            outcome.note
+        );
+        let (width, height) = image::image_dimensions(&outcome.output_path).unwrap();
+        assert!(width.max(height) >= 1000, "{width}x{height}");
+        let at_floor_edge = Settings {
+            max_file_kb: 0,
+            resize_enabled: true,
+            resize_max_edge: 1000,
+            ..Settings::default()
+        };
+        let floor_edge = optimize_file(
+            &tools,
+            &at_floor_edge,
+            &src,
+            &info,
+            Encode::Png,
+            &dir.join("floor-edge"),
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert!(
+            outcome.output_bytes <= floor_edge.output_bytes,
+            "saved {} which is larger than the 1000 px version {}",
+            outcome.output_bytes,
+            floor_edge.output_bytes
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

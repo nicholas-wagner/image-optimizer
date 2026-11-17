@@ -160,7 +160,9 @@ pub fn is_photo(format: SourceFormat, has_alpha: bool, color_count: Option<u32>)
     }
     match format {
         SourceFormat::Jpeg => true,
-        SourceFormat::Png | SourceFormat::Webp => color_count.map(|count| count > 256).unwrap_or(true),
+        SourceFormat::Png | SourceFormat::Webp => {
+            color_count.map(|count| count > 256).unwrap_or(true)
+        }
     }
 }
 
@@ -202,12 +204,34 @@ pub fn encodes_for(
     (photo, encodes)
 }
 
-pub fn pick(source_bytes: u64, photo: bool, candidates: &[(Encode, u64)]) -> Decision {
-    let kept: Vec<(Encode, u64)> = candidates
+/// `limit` is the per-file cap in bytes. The 8% WebP rule only compares
+/// candidates that meet it. When none do, the smallest honest attempt is
+/// still chosen so the original (which also misses) is not kept.
+pub fn pick(
+    source_bytes: u64,
+    photo: bool,
+    candidates: &[(Encode, u64)],
+    limit: Option<u64>,
+) -> Decision {
+    let mut kept: Vec<(Encode, u64)> = candidates
         .iter()
         .copied()
         .filter(|(_, bytes)| *bytes <= source_bytes)
         .collect();
+    let mut must_write = false;
+    if let Some(limit) = limit {
+        let fitting: Vec<(Encode, u64)> = kept
+            .iter()
+            .copied()
+            .filter(|(_, bytes)| *bytes <= limit)
+            .collect();
+        if fitting.is_empty() {
+            must_write = true;
+        } else {
+            kept = fitting;
+            must_write = source_bytes > limit;
+        }
+    }
     let compat = kept.iter().copied().find(|(encode, _)| {
         if photo {
             matches!(encode, Encode::Jpeg)
@@ -248,7 +272,7 @@ pub fn pick(source_bytes: u64, photo: bool, candidates: &[(Encode, u64)]) -> Dec
     else {
         return Decision::Keep;
     };
-    if source_bytes == 0 {
+    if source_bytes == 0 || must_write {
         return Decision::Use(chosen);
     }
     let saved = (source_bytes as f64 - bytes as f64) / source_bytes as f64;
@@ -300,17 +324,20 @@ mod tests {
         let source = 1000;
         // 5% smaller than the JPEG result, so JPEG wins. JPEG itself saves 20%.
         let slight = [(Encode::Jpeg, 800), (Encode::Webp(WebpMode::Lossy), 760)];
-        assert_eq!(pick(source, true, &slight), Decision::Use(Encode::Jpeg));
+        assert_eq!(
+            pick(source, true, &slight, None),
+            Decision::Use(Encode::Jpeg)
+        );
 
         let clear = [(Encode::Jpeg, 1000), (Encode::Webp(WebpMode::Lossy), 900)];
         assert_eq!(
-            pick(source, true, &clear),
+            pick(source, true, &clear, None),
             Decision::Use(Encode::Webp(WebpMode::Lossy))
         );
 
         let exact = [(Encode::Jpeg, 1000), (Encode::Webp(WebpMode::Lossy), 920)];
         assert_eq!(
-            pick(source, true, &exact),
+            pick(source, true, &exact, None),
             Decision::Use(Encode::Webp(WebpMode::Lossy))
         );
     }
@@ -318,14 +345,14 @@ mod tests {
     #[test]
     fn tiny_savings_keep_the_original() {
         let candidates = [(Encode::Jpeg, 990), (Encode::Webp(WebpMode::Lossy), 980)];
-        assert_eq!(pick(1000, true, &candidates), Decision::Keep);
+        assert_eq!(pick(1000, true, &candidates, None), Decision::Keep);
     }
 
     #[test]
     fn dropped_jpeg_still_allows_webp() {
         let candidates = [(Encode::Jpeg, 1100), (Encode::Webp(WebpMode::Lossy), 500)];
         assert_eq!(
-            pick(1000, true, &candidates),
+            pick(1000, true, &candidates, None),
             Decision::Use(Encode::Webp(WebpMode::Lossy))
         );
     }
@@ -333,11 +360,11 @@ mod tests {
     #[test]
     fn graphics_prefer_png_unless_webp_wins_clearly() {
         let close = [(Encode::Png, 700), (Encode::Webp(WebpMode::Lossless), 660)];
-        assert_eq!(pick(1000, false, &close), Decision::Use(Encode::Png));
+        assert_eq!(pick(1000, false, &close, None), Decision::Use(Encode::Png));
 
         let clear = [(Encode::Png, 700), (Encode::Webp(WebpMode::Lossless), 600)];
         assert_eq!(
-            pick(1000, false, &clear),
+            pick(1000, false, &clear, None),
             Decision::Use(Encode::Webp(WebpMode::Lossless))
         );
     }
@@ -356,10 +383,7 @@ mod tests {
         let (photo, encodes) =
             encodes_for(SourceFormat::Png, true, Some(10), 2000, 2000, false, true);
         assert!(!photo);
-        assert_eq!(
-            encodes,
-            vec![Encode::Png, Encode::Webp(WebpMode::Lossless)]
-        );
+        assert_eq!(encodes, vec![Encode::Png, Encode::Webp(WebpMode::Lossless)]);
     }
 
     #[test]
@@ -422,21 +446,58 @@ mod tests {
         let source = 1000u64;
         let with_webp = [(Encode::Jpeg, 800), (Encode::Webp(WebpMode::Lossy), 500)];
         assert_eq!(
-            pick(source, true, &with_webp),
+            pick(source, true, &with_webp, None),
             Decision::Use(Encode::Webp(WebpMode::Lossy))
         );
         assert_eq!(
-            pick(source, true, &[(Encode::Jpeg, 800)]),
+            pick(source, true, &[(Encode::Jpeg, 800)], None),
             Decision::Use(Encode::Jpeg)
         );
         let graphic_webp = [(Encode::Png, 700), (Encode::Webp(WebpMode::Lossless), 400)];
         assert_eq!(
-            pick(source, false, &graphic_webp),
+            pick(source, false, &graphic_webp, None),
             Decision::Use(Encode::Webp(WebpMode::Lossless))
         );
         assert_eq!(
-            pick(source, false, &[(Encode::Png, 700)]),
+            pick(source, false, &[(Encode::Png, 700)], None),
             Decision::Use(Encode::Png)
+        );
+    }
+
+    #[test]
+    fn a_size_limit_compares_only_files_that_fit() {
+        let both = [(Encode::Jpeg, 800), (Encode::Webp(WebpMode::Lossy), 760)];
+        assert_eq!(
+            pick(2000, true, &both, Some(1000)),
+            Decision::Use(Encode::Jpeg)
+        );
+
+        // 990 is only about 6% under 1050, but 1050 misses the cap.
+        let webp_fits = [(Encode::Jpeg, 1050), (Encode::Webp(WebpMode::Lossy), 990)];
+        assert_eq!(
+            pick(2000, true, &webp_fits, Some(1000)),
+            Decision::Use(Encode::Webp(WebpMode::Lossy))
+        );
+
+        let neither = [(Encode::Jpeg, 980), (Encode::Webp(WebpMode::Lossy), 970)];
+        assert_eq!(
+            pick(1000, true, &neither, Some(500)),
+            Decision::Use(Encode::Jpeg)
+        );
+
+        // The original is already under the cap and the winner barely saves.
+        let tiny = [(Encode::Jpeg, 990), (Encode::Webp(WebpMode::Lossy), 980)];
+        assert_eq!(pick(1000, true, &tiny, Some(2000)), Decision::Keep);
+
+        // The winner fits and the original does not, even though savings are under 3%.
+        assert_eq!(
+            pick(1000, true, &[(Encode::Jpeg, 980)], Some(995)),
+            Decision::Use(Encode::Jpeg)
+        );
+
+        assert_eq!(
+            pick(100, true, &[(Encode::Jpeg, 200)], Some(50)),
+            Decision::Keep
         );
     }
 
@@ -444,9 +505,6 @@ mod tests {
     fn photos_request_jpeg_and_lossy_webp() {
         let (photo, encodes) = encodes_for(SourceFormat::Jpeg, false, None, 400, 300, false, true);
         assert!(photo);
-        assert_eq!(
-            encodes,
-            vec![Encode::Jpeg, Encode::Webp(WebpMode::Lossy)]
-        );
+        assert_eq!(encodes, vec![Encode::Jpeg, Encode::Webp(WebpMode::Lossy)]);
     }
 }

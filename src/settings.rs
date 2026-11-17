@@ -6,6 +6,14 @@ use std::path::PathBuf;
 /// against 90, versus 0.036 at quality 80.
 pub const EMAIL_JPEG_QUALITY: u8 = 85;
 pub const EMAIL_MAX_EDGE: u32 = 1200;
+/// Lossy size targeting stops here. Lower than this is a ruined picture.
+pub const QUALITY_FLOOR: u8 = 60;
+/// Shrink-to-fit will not take the long side under this.
+pub const SIZE_FLOOR_EDGE: u32 = 1000;
+/// Each shrink step keeps about this much of the long side.
+pub const SIZE_SHRINK: f64 = 0.85;
+/// Simple-mode chips, in kilobytes. 1024 KB is 1 MB.
+pub const MAX_SIZE_CHIPS: [u32; 4] = [500, 1024, 2048, 5120];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Preset {
@@ -119,6 +127,9 @@ pub struct Settings {
     pub resize_enabled: bool,
     #[serde(default = "default_max_edge")]
     pub resize_max_edge: u32,
+    /// Per-file cap in kilobytes (1024 bytes). 0 is off.
+    #[serde(default)]
+    pub max_file_kb: u32,
     #[serde(default)]
     pub png_brute: bool,
     /// Smallest PNG. New files are saved as PNG until another style is picked.
@@ -162,6 +173,7 @@ impl Default for Settings {
             strip_metadata: false,
             resize_enabled: false,
             resize_max_edge: default_max_edge(),
+            max_file_kb: 0,
             png_brute: false,
             png_only: false,
             choose_best_format: true,
@@ -181,6 +193,20 @@ impl Settings {
         }
     }
 
+    /// Bytes the file must land at or under. `None` when the cap is off.
+    pub fn max_file_bytes(&self) -> Option<u64> {
+        if self.max_file_kb == 0 {
+            None
+        } else {
+            Some(u64::from(self.max_file_kb) * 1024)
+        }
+    }
+
+    /// Lowest lossy quality this job may use. The slider wins when it is already lower.
+    pub fn lossy_floor(&self, quality: u8) -> u8 {
+        QUALITY_FLOOR.min(quality.min(100))
+    }
+
     /// Encode choices and the output folder. The preset tag is not part of the job.
     pub fn same_job(&self, other: &Self) -> bool {
         self.jpeg_quality == other.jpeg_quality
@@ -191,6 +217,7 @@ impl Settings {
             && self.strip_metadata == other.strip_metadata
             && self.resize_enabled == other.resize_enabled
             && self.resize_max_edge == other.resize_max_edge
+            && self.max_file_kb == other.max_file_kb
             && self.png_brute == other.png_brute
             && self.png_only == other.png_only
             && self.choose_best_format == other.choose_best_format
@@ -227,6 +254,45 @@ impl Settings {
             }
         }
         self.preset = Preset::Custom;
+    }
+}
+
+/// "Off", "500 KB", "1 MB", or "1500 KB" for a custom value.
+pub fn max_size_label(kb: u32) -> String {
+    if kb == 0 {
+        return "Off".to_string();
+    }
+    if kb >= 1024 && kb.is_multiple_of(1024) {
+        return format!("{} MB", kb / 1024);
+    }
+    format!("{kb} KB")
+}
+
+pub fn fits_note(kb: u32) -> String {
+    format!("fits under {}", max_size_label(kb))
+}
+
+pub fn missed_fit_note(kb: u32) -> String {
+    format!(
+        "Couldn't get under {} without going below {} px, saved the smallest version",
+        max_size_label(kb),
+        SIZE_FLOOR_EDGE
+    )
+}
+
+/// Next long side while chasing a file size. `None` once another step would
+/// go under [`SIZE_FLOOR_EDGE`].
+pub fn next_long_edge(width: u32, height: u32) -> Option<u32> {
+    let long = width.max(height);
+    if long <= SIZE_FLOOR_EDGE {
+        return None;
+    }
+    let shrunk = ((long as f64) * SIZE_SHRINK).round() as u32;
+    let next = shrunk.max(SIZE_FLOOR_EDGE);
+    if next >= long {
+        None
+    } else {
+        Some(next)
     }
 }
 
@@ -394,5 +460,65 @@ mod tests {
         assert!(!a.same_job(&b));
         a.output_dir = Some(PathBuf::from("/tmp/out"));
         assert!(a.same_job(&b));
+    }
+
+    #[test]
+    fn max_size_defaults_off_and_old_settings_stay_off() {
+        assert_eq!(Settings::default().max_file_kb, 0);
+        assert_eq!(Settings::default().max_file_bytes(), None);
+        assert_eq!(Preset::Compress.baseline().max_file_kb, 0);
+        assert_eq!(Preset::Email.baseline().max_file_kb, 0);
+        let settings: Settings =
+            serde_json::from_str(r#"{"jpeg_quality":90,"preset":"Compress"}"#).unwrap();
+        assert_eq!(settings.max_file_kb, 0);
+        let mut synced = settings;
+        synced.sync_preset();
+        assert_eq!(synced.preset, Preset::Compress);
+    }
+
+    #[test]
+    fn max_size_is_part_of_the_job_and_a_style_clears_it() {
+        let mut sized = Preset::Web.baseline();
+        sized.max_file_kb = 2048;
+        assert_eq!(sized.max_file_bytes(), Some(2048 * 1024));
+        assert!(!sized.same_job(&Preset::Web.baseline()));
+        sized.sync_preset();
+        assert_eq!(sized.preset, Preset::Custom);
+
+        sized.output_dir = Some(PathBuf::from("/tmp/out"));
+        sized.apply_preset(Preset::Web);
+        assert_eq!(sized.max_file_kb, 0);
+        assert_eq!(sized.preset, Preset::Web);
+        assert_eq!(sized.output_dir, Some(PathBuf::from("/tmp/out")));
+        assert!(sized.resize_enabled);
+
+        let mut back = Preset::Web.baseline();
+        back.max_file_kb = 1024;
+        back.sync_preset();
+        assert_eq!(back.preset, Preset::Custom);
+        back.max_file_kb = 0;
+        back.sync_preset();
+        assert_eq!(back.preset, Preset::Web);
+    }
+
+    #[test]
+    fn max_size_labels_and_the_shrink_floor() {
+        assert_eq!(max_size_label(0), "Off");
+        assert_eq!(max_size_label(500), "500 KB");
+        assert_eq!(max_size_label(1024), "1 MB");
+        assert_eq!(max_size_label(2048), "2 MB");
+        assert_eq!(max_size_label(5120), "5 MB");
+        assert_eq!(max_size_label(1500), "1500 KB");
+        assert_eq!(fits_note(2048), "fits under 2 MB");
+        assert_eq!(
+            missed_fit_note(500),
+            "Couldn't get under 500 KB without going below 1000 px, saved the smallest version"
+        );
+        assert_eq!(next_long_edge(2000, 1000), Some(1700));
+        assert_eq!(next_long_edge(1100, 800), Some(1000));
+        assert_eq!(next_long_edge(1000, 800), None);
+        assert_eq!(next_long_edge(800, 600), None);
+        assert_eq!(Settings::default().lossy_floor(90), QUALITY_FLOOR);
+        assert_eq!(Settings::default().lossy_floor(45), 45);
     }
 }

@@ -7,14 +7,15 @@ One file. Nothing to install. It optimizes JPEG, PNG, and WebP with the real `jp
 Linux / WSL: run `./image-optimizer`. The window opens in **Simple**.
 
 1. Pick a style. **Smaller file** keeps the full size. **For the web** shrinks the long side to 1600 px. **For email** shrinks the long side to 1200 px and saves JPEG or PNG only. **Perfect quality** does not reduce quality. **Smallest PNG** saves every file as PNG with maximum compression. That one is slow.
-2. Click **Add images** at the bottom, or drop files onto the window.
-3. Click **Optimize**.
+2. Optional: set **Max size per file**. It starts on **Off**. The other choices are 500 KB, 1 MB, 2 MB, and 5 MB. Advanced can type a different KB value. Each file is handled on its own.
+3. Click **Add images** at the bottom, or drop files onto the window.
+4. Click **Optimize**.
 
 Originals stay untouched. Results land in an `optimized` folder next to the first image. Click a file to compare before and after. The same button stays at the bottom while you scroll.
 
-**Advanced**, in the header, opens the rest: quality sliders, resize, output folder, metadata, PNG maximum compression, per-file format (Best, JPEG, PNG, WebP, or Skip), add by path, and the command that ran. Check files to change their format together.
+**Advanced**, in the header, opens the rest: quality sliders, resize, a custom max size in KB, output folder, metadata, PNG maximum compression, per-file format (Best, JPEG, PNG, WebP, or Skip), add by path, and the command that ran. Check files to change their format together.
 
-**Your settings** appears when a control no longer matches a style. In Advanced, clicking it scrolls the controls into view when a preview would hide them. Picking a style again resets those controls and keeps the output folder. Changing a style or a slider brings the button back to **Optimize**.
+**Your settings** appears when a control no longer matches a style. In Advanced, clicking it scrolls the controls into view when a preview would hide them. Picking a style again resets those controls and keeps the output folder. Changing a style, the max size, or a slider brings the button back to **Optimize**.
 
 Windows: run `image-optimizer.exe`. It uses the normal Windows file dialog.
 
@@ -29,6 +30,7 @@ The first launch unpacks the three tools into `~/.cache/image-optimizer/bin/`. I
 - PNG uses `pngcrush -reduce`. Maximum compression adds `-brute` and is slow. **For email** does not turn that on.
 - Strip metadata is off, except in **For email**. Stripping removes comments, Exif, IPTC, and XMP, and keeps the ICC profile (`jpegoptim --keep-icc`, and pngcrush does not remove `iCCP`).
 - Resize is off in **Compress**. **Web** turns it on at 1600 px. **For email** turns it on at 1200 px and does not enlarge a smaller image. Size chips are 800, 1200, 1600, and 1920. That is what cuts multi‑megabyte photos down for the web and for email.
+- **Max size per file** is off until you pick one. JPEG uses `jpegoptim --size`, and WebP uses `cwebp -size`. Quality is not pushed below 60 (or below the quality you set, if that is lower). PNG has no quality knob, so the long side shrinks by about 15% and the file is tried again. Nothing is shrunk below 1000 px. If the file still does not fit, the row says so and the smallest version is kept. Saved settings from older versions have no max size, so they stay off.
 - Recommend compares candidates and picks the smaller format. WebP has to be at least 8% smaller than JPEG (photos) or PNG (graphics), and the winner has to save at least 3%, or the original is kept. **For email** never offers WebP. It keeps that JPEG-or-PNG choice.
 
 ## Releases
