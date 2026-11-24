@@ -101,9 +101,19 @@ enum UpdateOffer {
 }
 
 enum Msg {
-    Row { gen: u64, index: usize, patch: RowPatch },
-    WorkingOn { gen: u64, index: usize, name: String },
-    Finished { gen: u64 },
+    Row {
+        gen: u64,
+        index: usize,
+        patch: RowPatch,
+    },
+    WorkingOn {
+        gen: u64,
+        index: usize,
+        name: String,
+    },
+    Finished {
+        gen: u64,
+    },
     Preview {
         path: PathBuf,
         before: Option<PreviewImage>,
@@ -669,7 +679,9 @@ impl OptimizerApp {
             ui.heading(format!("Image Optimizer {}", env!("CARGO_PKG_VERSION")));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add(egui::Button::new(egui::RichText::new("Licenses").size(14.0)))
+                    .add(egui::Button::new(
+                        egui::RichText::new("Licenses").size(14.0),
+                    ))
                     .on_hover_text("Notices for the tools packed inside this app.")
                     .clicked()
                 {
@@ -688,8 +700,7 @@ impl OptimizerApp {
         );
         self.update_banner(ui, ctx);
 
-        if !self.advanced && !self.coach_dismissed && self.tools.is_ok() && self.rows.is_empty()
-        {
+        if !self.advanced && !self.coach_dismissed && self.tools.is_ok() && self.rows.is_empty() {
             ui.add_space(10.0);
             self.coach_banner(ui);
         }
@@ -710,6 +721,10 @@ impl OptimizerApp {
                 if self.tools.is_ok() {
                     ui.add_enabled_ui(!self.running, |ui| {
                         self.preset_row(ui);
+                        if !self.advanced {
+                            ui.add_space(10.0);
+                            self.max_size_row(ui);
+                        }
                     });
                     kind = self.step_now();
                     ui.add_space(if self.rows.is_empty() { 14.0 } else { 8.0 });
@@ -887,7 +902,7 @@ impl OptimizerApp {
         } else if self.tools.is_ok() {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    egui::RichText::new("Need quality, size, or format controls?")
+                    egui::RichText::new("Need quality, resize, or format controls?")
                         .color(muted_text()),
                 );
                 if ui.button("Open Advanced").clicked() {
@@ -903,9 +918,11 @@ impl OptimizerApp {
                 .default_width(640.0)
                 .default_height(520.0)
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
-                        ui.label(crate::licenses::TEXT);
-                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(460.0)
+                        .show(ui, |ui| {
+                            ui.label(crate::licenses::TEXT);
+                        });
                 });
         }
         ui.add_space(8.0);
@@ -933,8 +950,7 @@ impl OptimizerApp {
                     ui.label(lead);
                     match &self.update_offer {
                         UpdateOffer::Available(_) | UpdateOffer::Failed { .. } => {
-                            let label = if matches!(self.update_offer, UpdateOffer::Failed { .. })
-                            {
+                            let label = if matches!(self.update_offer, UpdateOffer::Failed { .. }) {
                                 "Try again"
                             } else {
                                 "Update"
@@ -948,13 +964,13 @@ impl OptimizerApp {
                         }
                         UpdateOffer::Restart(_) => {
                             let button = egui::Button::new("Restart");
-                            let response = ui
-                                .add_enabled(!self.running, button)
-                                .on_hover_text(if self.running {
+                            let response = ui.add_enabled(!self.running, button).on_hover_text(
+                                if self.running {
                                     "This waits until the current run finishes."
                                 } else {
                                     "Closes this window and opens the new version."
-                                });
+                                },
+                            );
                             if response.clicked() {
                                 restart = true;
                             }
@@ -1050,6 +1066,43 @@ impl OptimizerApp {
         }
     }
 
+    fn max_size_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("Max size per file")
+                    .size(14.0)
+                    .color(ink_text()),
+            );
+            self.size_chip(ui, "Off", 0);
+            for kb in crate::settings::MAX_SIZE_CHIPS {
+                let label = crate::settings::max_size_label(kb);
+                self.size_chip(ui, &label, kb);
+            }
+            let custom = self.settings.max_file_kb;
+            if custom > 0 && !crate::settings::MAX_SIZE_CHIPS.contains(&custom) {
+                let label = crate::settings::max_size_label(custom);
+                self.size_chip(ui, &label, custom);
+            }
+        });
+        hint(ui, "Each file on its own. Off leaves the style as it is.");
+    }
+
+    fn size_chip(&mut self, ui: &mut egui::Ui, label: &str, kb: u32) {
+        let on = self.settings.max_file_kb == kb;
+        let mut text = egui::RichText::new(label).size(14.0);
+        if on {
+            text = text.color(egui::Color32::WHITE);
+        }
+        let mut button = egui::Button::new(text).min_size(egui::vec2(72.0, 30.0));
+        if on {
+            button = button.fill(accent());
+        }
+        if ui.add(button).clicked() {
+            self.settings.max_file_kb = kb;
+            self.settings.sync_preset();
+        }
+    }
+
     fn pick_preset(&mut self, preset: Preset) {
         if preset == Preset::Custom {
             self.advanced = true;
@@ -1090,9 +1143,8 @@ impl OptimizerApp {
                 .all(|row| row.choice == RowChoice::Skip);
         let try_web = matches!(kind, StepKind::Open) && !wrote && !all_skipped;
         let label = action_label(kind, wrote, all_skipped);
-        let stale = !self.running
-            && self.results_stale()
-            && self.rows.iter().any(has_previous_result);
+        let stale =
+            !self.running && self.results_stale() && self.rows.iter().any(has_previous_result);
         let saved = self
             .saved_line()
             .filter(|_| matches!(kind, StepKind::Open) && wrote);
@@ -1318,10 +1370,7 @@ impl OptimizerApp {
             if webp_on {
                 hint(ui, quality_hint(self.settings.webp_quality));
             }
-            ui.checkbox(
-                &mut self.settings.webp_lossless,
-                "Keep WebP quality exact",
-            );
+            ui.checkbox(&mut self.settings.webp_lossless, "Keep WebP quality exact");
             hint(
                 ui,
                 "Images with transparency always use lossless WebP, so the clear parts stay clear.",
@@ -1363,6 +1412,17 @@ impl OptimizerApp {
                 ui,
                 "Phone photos are often 4000 px. For email uses 1200 px. For the web uses 1600 px. Smaller pictures stay their own size.",
             );
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Max size per file").strong());
+            ui.add(
+                egui::DragValue::new(&mut self.settings.max_file_kb)
+                    .range(0..=100_000)
+                    .suffix(" KB"),
+            );
+            hint(
+                ui,
+                "0 is off. 1024 KB is 1 MB. Each file is handled on its own. Quality stays at 60 or above, unless you set it lower, and the picture is not shrunk below 1000 px. If it still does not fit, the smallest version is saved and the row says so.",
+            );
         });
 
         group_card(ui, "Where files go", |ui| {
@@ -1377,7 +1437,8 @@ impl OptimizerApp {
                 if ui.button("Choose folder").clicked() {
                     self.prompt_output();
                 }
-                if self.settings.output_dir.is_some() && ui.button("Use the default folder").clicked()
+                if self.settings.output_dir.is_some()
+                    && ui.button("Use the default folder").clicked()
                 {
                     self.settings.output_dir = None;
                 }
@@ -1406,13 +1467,22 @@ impl OptimizerApp {
                     ui,
                     "Photos and large images (long side 1200 px or more) are compared as JPEG quality 90, 4:2:0. Small art stays PNG. WebP is used only when it is at least 8% smaller, and the winner has to save at least 3%.",
                 );
+                if self.settings.max_file_kb > 0 {
+                    hint(
+                        ui,
+                        "Only versions that fit under the max size are compared. If none fit, the smallest one is saved and the row says it could not fit.",
+                    );
+                }
             } else if self.settings.choose_best_format {
                 hint(
                     ui,
                     "Photos and large images are saved as JPEG. Graphics and transparency stay PNG. WebP is not used. Pick another style to compare WebP again.",
                 );
             } else {
-                hint(ui, "Each file stays in its own format and is only recompressed.");
+                hint(
+                    ui,
+                    "Each file stays in its own format and is only recompressed.",
+                );
             }
             ui.checkbox(
                 &mut self.settings.png_brute,
@@ -1460,12 +1530,7 @@ impl OptimizerApp {
                 hint(ui, "Add a file, then optimize, to see its command.");
             } else if let Some((command, status, choice)) = command_view {
                 if command.is_empty() {
-                    if choice == RowChoice::Skip
-                        || matches!(
-                            status.as_str(),
-                            "Already small enough" | "Kept original" | "Skipped"
-                        )
-                    {
+                    if choice == RowChoice::Skip || stopped_without_output(status.as_str()) {
                         hint(ui, "No command. This file was kept as it is.");
                     } else {
                         hint(ui, "Optimize this file to see its command.");
@@ -1480,8 +1545,10 @@ impl OptimizerApp {
                         .corner_radius(egui::CornerRadius::same(6))
                         .show(ui, |ui| {
                             ui.add(
-                                egui::Label::new(egui::RichText::new(command).monospace().size(13.0))
-                                    .wrap_mode(egui::TextWrapMode::Wrap),
+                                egui::Label::new(
+                                    egui::RichText::new(command).monospace().size(13.0),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Wrap),
                             );
                         });
                 }
@@ -1596,6 +1663,7 @@ impl OptimizerApp {
             &self.rows[index],
             self.results_stale(),
             self.settings.webp_lossless,
+            self.settings.max_file_bytes(),
         );
         let stale_result = self.results_stale() && output_bytes.is_some();
         let name = file_label(&path);
@@ -1609,24 +1677,26 @@ impl OptimizerApp {
             let tx = self.tx.clone();
             let preview_output = output.clone();
             // Windows gives new threads a 1 MB stack. WebP decoding needs more.
-            let _ = thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(move || {
-                let before = load_preview(&path);
-                let after = match preview_output.as_deref() {
-                    Some(output) => load_preview(output).map(Some),
-                    None => Ok(None),
-                };
-                let error = match (&before, &after) {
-                    (Err(err), _) => format!("Could not preview the original: {err}"),
-                    (_, Err(err)) => format!("Could not preview the result: {err}"),
-                    _ => String::new(),
-                };
-                let _ = tx.send(Msg::Preview {
-                    path,
-                    before: before.ok(),
-                    after: after.ok().flatten(),
-                    error,
+            let _ = thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || {
+                    let before = load_preview(&path);
+                    let after = match preview_output.as_deref() {
+                        Some(output) => load_preview(output).map(Some),
+                        None => Ok(None),
+                    };
+                    let error = match (&before, &after) {
+                        (Err(err), _) => format!("Could not preview the original: {err}"),
+                        (_, Err(err)) => format!("Could not preview the result: {err}"),
+                        _ => String::new(),
+                    };
+                    let _ = tx.send(Msg::Preview {
+                        path,
+                        before: before.ok(),
+                        after: after.ok().flatten(),
+                        error,
+                    });
                 });
-            });
             ctx.request_repaint();
         }
 
@@ -1634,12 +1704,7 @@ impl OptimizerApp {
         ui.add_space(2.0);
         ui.label(egui::RichText::new(name).strong().size(16.0));
         if let Some(info) = &info {
-            let mut line = format!(
-                "{} · {} × {}",
-                info.format.label(),
-                info.width,
-                info.height
-            );
+            let mut line = format!("{} · {} × {}", info.format.label(), info.width, info.height);
             if info.has_alpha {
                 line.push_str(" · has transparency");
             }
@@ -1665,7 +1730,8 @@ impl OptimizerApp {
         }
         if stale_result {
             ui.label(
-                egui::RichText::new("This comparison used the previous settings.").color(warn_text()),
+                egui::RichText::new("This comparison used the previous settings.")
+                    .color(warn_text()),
             );
         }
         if let Some(line) = &webp_line {
@@ -1688,8 +1754,14 @@ impl OptimizerApp {
         if before.is_some() && after.is_some() {
             let text = egui::RichText::new("Compare").color(egui::Color32::WHITE);
             if ui
-                .add(egui::Button::new(text).fill(accent()).min_size(egui::vec2(120.0, 32.0)))
-                .on_hover_text("Open the slider across the window. Left of the line is the original.")
+                .add(
+                    egui::Button::new(text)
+                        .fill(accent())
+                        .min_size(egui::vec2(120.0, 32.0)),
+                )
+                .on_hover_text(
+                    "Open the slider across the window. Left of the line is the original.",
+                )
                 .clicked()
             {
                 self.compare_large = true;
@@ -1771,12 +1843,9 @@ impl OptimizerApp {
                         if mode_button(ui, "Actual size", self.compare_actual).clicked() {
                             self.compare_actual = true;
                         }
-                        let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
-                        let full_label = if fullscreen {
-                            "Window"
-                        } else {
-                            "Full screen"
-                        };
+                        let fullscreen =
+                            ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
+                        let full_label = if fullscreen { "Window" } else { "Full screen" };
                         if mode_button(ui, full_label, fullscreen).clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
                         }
@@ -1790,9 +1859,7 @@ impl OptimizerApp {
                         )
                         .color(egui::Color32::from_rgb(203, 213, 225)),
                     );
-                    ui.add(
-                        egui::Slider::new(&mut self.compare_split, 0.0..=1.0).show_value(false),
-                    );
+                    ui.add(egui::Slider::new(&mut self.compare_split, 0.0..=1.0).show_value(false));
                     let split = &mut self.compare_split;
                     let actual = self.compare_actual;
                     let height = ui.available_height().max(120.0);
@@ -2122,8 +2189,12 @@ fn step_kicker(kind: StepKind, wrote: bool) -> &'static str {
 fn step_detail(kind: StepKind) -> &'static str {
     match kind {
         StepKind::NeedTools => "This copy of the app is missing its tools.",
-        StepKind::Add => "JPEG, PNG, or WebP. Drop a file or a folder here, or use the button below.",
-        StepKind::Optimize => "Originals stay where they are. A copy is written only when it is smaller.",
+        StepKind::Add => {
+            "JPEG, PNG, or WebP. Drop a file or a folder here, or use the button below."
+        }
+        StepKind::Optimize => {
+            "Originals stay where they are. A copy is written only when it is smaller."
+        }
         StepKind::Working => "You can cancel. Files already finished are kept.",
         StepKind::Open => "",
     }
@@ -2246,13 +2317,15 @@ fn apply_theme(ctx: &egui::Context) {
     // Slider rails use this same fill. White on a white card hides the rail.
     visuals.widgets.inactive.bg_fill = track;
     // Scrollbar handles use this color. Ink here paints a black bar over the list.
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 116, 139));
+    visuals.widgets.inactive.fg_stroke =
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 116, 139));
     // The light theme's idle checkbox stroke has width 0. A white fill on a
     // white card then disappears until the box is checked.
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.5, muted_text());
     visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(226, 232, 240);
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.5, ink_text());
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(71, 85, 105));
+    visuals.widgets.hovered.fg_stroke =
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(71, 85, 105));
     visuals.widgets.active.bg_fill = accent();
     // Do not paint this white. Strong labels take their color from here.
     visuals.widgets.active.fg_stroke = egui::Stroke::new(2.0, ink_text());
@@ -2276,12 +2349,13 @@ fn needs_run(row: &FileRow, stale: bool) -> bool {
     !settled(row)
 }
 
+fn stopped_without_output(status: &str) -> bool {
+    matches!(status, "Already small enough" | "Kept original" | "Skipped")
+        || status.starts_with("Couldn't get under")
+}
+
 fn settled(row: &FileRow) -> bool {
-    row.output_path.is_some()
-        || matches!(
-            row.status.as_str(),
-            "Already small enough" | "Kept original" | "Skipped"
-        )
+    row.output_path.is_some() || stopped_without_output(&row.status)
 }
 
 fn has_previous_result(row: &FileRow) -> bool {
@@ -2290,6 +2364,7 @@ fn has_previous_result(row: &FileRow) -> bool {
             row.status.as_str(),
             "Already small enough" | "Kept original"
         )
+        || row.status.starts_with("Couldn't get under")
 }
 
 fn finished_title(wrote: bool, all_skipped: bool, files: usize) -> String {
@@ -2329,7 +2404,11 @@ fn format_label(row: &FileRow, webp_lossless: bool) -> String {
         RowChoice::Jpeg => "JPEG".to_string(),
         RowChoice::Png => "PNG".to_string(),
         RowChoice::Webp => {
-            let alpha = row.info.as_ref().map(|info| info.has_alpha).unwrap_or(false);
+            let alpha = row
+                .info
+                .as_ref()
+                .map(|info| info.has_alpha)
+                .unwrap_or(false);
             if alpha || webp_lossless {
                 "WebP lossless".to_string()
             } else {
@@ -2532,7 +2611,12 @@ fn preset_plain(preset: Preset) -> (&'static str, &'static str) {
     }
 }
 
-fn preset_card(ui: &mut egui::Ui, preset: Preset, selected: bool, show_badge: bool) -> egui::Response {
+fn preset_card(
+    ui: &mut egui::Ui,
+    preset: Preset,
+    selected: bool,
+    show_badge: bool,
+) -> egui::Response {
     let (title, detail) = preset_plain(preset);
     let width = ui.available_width();
     let height = if show_badge { 156.0 } else { 124.0 };
@@ -2552,7 +2636,9 @@ fn preset_card(ui: &mut egui::Ui, preset: Preset, selected: bool, show_badge: bo
             .corner_radius(egui::CornerRadius::same(10)),
     );
     if ui.is_enabled() {
-        response.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
+        response
+            .clone()
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
     }
     let rect = response.rect.shrink2(egui::vec2(12.0, 10.0));
     let painter = ui.painter_at(rect);
@@ -2644,7 +2730,12 @@ fn quality_hint(quality: u8) -> &'static str {
 }
 
 /// Gray compare-panel line. Same 8% bar Best uses, measured against the JPEG or PNG.
-fn webp_savings_line(row: &FileRow, stale: bool, webp_lossless: bool) -> Option<String> {
+fn webp_savings_line(
+    row: &FileRow,
+    stale: bool,
+    webp_lossless: bool,
+    limit: Option<u64>,
+) -> Option<String> {
     if stale || row.info.is_err() {
         return None;
     }
@@ -2673,6 +2764,10 @@ fn webp_savings_line(row: &FileRow, stale: bool, webp_lossless: bool) -> Option<
         _ => None,
     })?;
     if compat_bytes == 0 || webp_bytes >= compat_bytes {
+        return None;
+    }
+    // Same rule as Best: only compare files that both landed under the cap.
+    if limit.is_some_and(|limit| compat_bytes > limit || webp_bytes > limit) {
         return None;
     }
     let saved = (compat_bytes - webp_bytes) as f64 / compat_bytes as f64;
@@ -2732,6 +2827,9 @@ fn result_label(row: &FileRow, webp_lossless: bool, advanced: bool) -> String {
 }
 
 fn result_color(row: &FileRow) -> egui::Color32 {
+    if row.status.contains("Couldn't get under") {
+        return warn_text();
+    }
     if row.info.is_err() {
         return egui::Color32::from_rgb(153, 27, 27);
     }
@@ -2818,33 +2916,31 @@ fn run_job(
         let output_dir = output_dir.clone();
         let cancel = cancel.clone();
         let tx = tx.clone();
-        handles.push(thread::spawn(move || {
-            loop {
-                if cancel.is_cancelled() {
-                    break;
-                }
-                let cursor = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if cursor >= total {
-                    break;
-                }
-                let item = &items[cursor];
-                let name = item
-                    .path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| item.path.display().to_string());
-                let _ = tx.send(Msg::WorkingOn {
-                    gen,
-                    index: item.index,
-                    name,
-                });
-                let patch = optimize_item(&tools, &settings, item, &output_dir, &cancel);
-                let _ = tx.send(Msg::Row {
-                    gen,
-                    index: item.index,
-                    patch,
-                });
+        handles.push(thread::spawn(move || loop {
+            if cancel.is_cancelled() {
+                break;
             }
+            let cursor = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if cursor >= total {
+                break;
+            }
+            let item = &items[cursor];
+            let name = item
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| item.path.display().to_string());
+            let _ = tx.send(Msg::WorkingOn {
+                gen,
+                index: item.index,
+                name,
+            });
+            let patch = optimize_item(&tools, &settings, item, &output_dir, &cancel);
+            let _ = tx.send(Msg::Row {
+                gen,
+                index: item.index,
+                patch,
+            });
         }));
     }
     for handle in handles {
@@ -2875,8 +2971,16 @@ fn optimize_item(
         let measured = rec.sizes.clone();
         let encode = match rec.decision {
             Decision::Keep => {
+                let status = if settings
+                    .max_file_bytes()
+                    .is_some_and(|limit| item.info.bytes > limit)
+                {
+                    crate::settings::missed_fit_note(settings.max_file_kb)
+                } else {
+                    "Already small enough".to_string()
+                };
                 return RowPatch {
-                    status: "Already small enough".to_string(),
+                    status,
                     recommendation: Some(rec),
                     measured: Some(measured),
                     output_bytes: None,
@@ -2888,18 +2992,12 @@ fn optimize_item(
             Decision::Use(encode) => encode,
         };
         let mut patch = match execute::optimize_file(
-            tools,
-            settings,
-            &item.path,
-            &item.info,
-            encode,
-            output_dir,
-            cancel,
+            tools, settings, &item.path, &item.info, encode, output_dir, cancel,
         ) {
             Ok(outcome) => done_patch(outcome),
             Err(err) => return error_patch(err),
         };
-        patch.status = encode.label().to_string();
+        patch.status = status_with_note(&patch.status, encode.label());
         patch.recommendation = Some(rec);
         patch.measured = Some(measured);
         return patch;
@@ -2933,26 +3031,15 @@ fn optimize_item(
         Err(err) => return error_patch(err),
     };
     match execute::optimize_file(
-        tools,
-        settings,
-        &item.path,
-        &item.info,
-        encode,
-        output_dir,
-        cancel,
+        tools, settings, &item.path, &item.info, encode, output_dir, cancel,
     ) {
         Ok(outcome) => {
             let mut patch = done_patch(outcome);
             if settings.webp_allowed && matches!(encode, Encode::Jpeg | Encode::Png) {
                 let mode = model::webp_chip_mode(item.info.has_alpha, settings.webp_lossless);
-                if let Ok(webp_bytes) = execute::measure_webp(
-                    tools,
-                    settings,
-                    &item.path,
-                    &item.info,
-                    mode,
-                    cancel,
-                ) {
+                if let Ok(webp_bytes) =
+                    execute::measure_webp(tools, settings, &item.path, &item.info, mode, cancel)
+                {
                     let compat_bytes = patch.output_bytes.unwrap_or(0);
                     patch.measured = Some(vec![
                         (encode, compat_bytes),
@@ -2963,6 +3050,17 @@ fn optimize_item(
             patch
         }
         Err(err) => error_patch(err),
+    }
+}
+
+/// Best names the format. A size note from the encode stays on the row.
+fn status_with_note(done: &str, label: &str) -> String {
+    match done
+        .strip_prefix("Done (")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        Some(note) if !note.is_empty() => done.to_string(),
+        _ => label.to_string(),
     }
 }
 
@@ -3096,17 +3194,11 @@ fn comparison_wipe_at(
         egui::Color32::WHITE,
     );
     painter.line_segment(
-        [
-            egui::pos2(cut, rect.top()),
-            egui::pos2(cut, rect.bottom()),
-        ],
+        [egui::pos2(cut, rect.top()), egui::pos2(cut, rect.bottom())],
         egui::Stroke::new(5.0, egui::Color32::from_black_alpha(180)),
     );
     painter.line_segment(
-        [
-            egui::pos2(cut, rect.top()),
-            egui::pos2(cut, rect.bottom()),
-        ],
+        [egui::pos2(cut, rect.top()), egui::pos2(cut, rect.bottom())],
         egui::Stroke::new(2.0, egui::Color32::WHITE),
     );
     painter.circle_filled(egui::pos2(cut, rect.center().y), 11.0, egui::Color32::WHITE);
@@ -3154,7 +3246,10 @@ mod tests {
 
         assert_eq!(step_kind(true, 3, 3, false), StepKind::Optimize);
         assert_eq!(step_action(StepKind::Optimize), "Optimize");
-        assert_eq!(step_title(StepKind::Optimize, 3), "Ready to shrink 3 images");
+        assert_eq!(
+            step_title(StepKind::Optimize, 3),
+            "Ready to shrink 3 images"
+        );
         assert_eq!(step_title(StepKind::Optimize, 1), "Ready to shrink 1 image");
         assert_eq!(step_title(StepKind::Add, 0), "Drop your images here");
         assert_eq!(step_kicker(StepKind::Add, false), "Start here");
@@ -3162,7 +3257,10 @@ mod tests {
         assert_eq!(step_kicker(StepKind::Open, false), "Nothing new");
         assert_eq!(action_label(StepKind::Add, false, false), "Add images");
         assert_eq!(action_label(StepKind::Open, true, false), "Open folder");
-        assert_eq!(action_label(StepKind::Open, false, false), "Shrink for the web");
+        assert_eq!(
+            action_label(StepKind::Open, false, false),
+            "Shrink for the web"
+        );
         assert_eq!(action_label(StepKind::Open, false, true), "");
 
         assert_eq!(step_kind(true, 3, 1, true), StepKind::Working);
@@ -3247,6 +3345,37 @@ mod tests {
             row_result(&jpeg, false),
             "JPEG · 1000 B · saved 50% · resized to 1600x900"
         );
+        let fitted = sample_row("Done (fits under 2 MB)", true, RowChoice::Jpeg);
+        assert_eq!(
+            row_result(&fitted, false),
+            "JPEG · 1000 B · saved 50% · fits under 2 MB"
+        );
+        let missed = sample_row(
+            "Done (Couldn't get under 500 KB without going below 1000 px, saved the smallest version)",
+            true,
+            RowChoice::Png,
+        );
+        assert!(row_result(&missed, false).contains(
+            "Couldn't get under 500 KB without going below 1000 px, saved the smallest version"
+        ));
+        assert_eq!(result_color(&missed), warn_text());
+        let kept_miss = sample_row(
+            "Couldn't get under 500 KB without going below 1000 px, saved the smallest version",
+            false,
+            RowChoice::Recommended,
+        );
+        assert!(settled(&kept_miss));
+        assert!(!needs_run(&kept_miss, false));
+        assert_eq!(result_label(&kept_miss, false, false), kept_miss.status);
+        assert_eq!(status_with_note("Done", "JPEG"), "JPEG");
+        assert_eq!(
+            status_with_note("Done (fits under 1 MB)", "JPEG"),
+            "Done (fits under 1 MB)"
+        );
+        assert_eq!(
+            status_with_note("Done (resized to 1600x900)", "JPEG"),
+            "Done (resized to 1600x900)"
+        );
         assert_eq!(
             row_result(&sample_row("Ready", false, RowChoice::Skip), false),
             "Skip"
@@ -3323,15 +3452,27 @@ mod tests {
     #[test]
     fn email_puts_a_webp_row_back_on_best_and_leaves_jpeg_alone() {
         assert_eq!(
-            next_row_choice(RowChoice::Webp, RowChoice::Recommended, Some(RowChoice::Webp)),
+            next_row_choice(
+                RowChoice::Webp,
+                RowChoice::Recommended,
+                Some(RowChoice::Webp)
+            ),
             Some(RowChoice::Recommended)
         );
         assert_eq!(
-            next_row_choice(RowChoice::Jpeg, RowChoice::Recommended, Some(RowChoice::Webp)),
+            next_row_choice(
+                RowChoice::Jpeg,
+                RowChoice::Recommended,
+                Some(RowChoice::Webp)
+            ),
             None
         );
         assert_eq!(
-            next_row_choice(RowChoice::Skip, RowChoice::Recommended, Some(RowChoice::Webp)),
+            next_row_choice(
+                RowChoice::Skip,
+                RowChoice::Recommended,
+                Some(RowChoice::Webp)
+            ),
             None
         );
     }
@@ -3363,11 +3504,19 @@ mod tests {
             Some(RowChoice::Recommended)
         );
         assert_eq!(
-            next_row_choice(RowChoice::Jpeg, RowChoice::Recommended, Some(RowChoice::Png)),
+            next_row_choice(
+                RowChoice::Jpeg,
+                RowChoice::Recommended,
+                Some(RowChoice::Png)
+            ),
             None
         );
         assert_eq!(
-            next_row_choice(RowChoice::Skip, RowChoice::Recommended, Some(RowChoice::Png)),
+            next_row_choice(
+                RowChoice::Skip,
+                RowChoice::Recommended,
+                Some(RowChoice::Png)
+            ),
             None
         );
     }
@@ -3404,14 +3553,14 @@ mod tests {
             (Encode::Webp(WebpMode::Lossy), 780),
         ]);
         assert_eq!(
-            webp_savings_line(&jpeg, false, false).as_deref(),
+            webp_savings_line(&jpeg, false, false, None).as_deref(),
             Some("WebP would be 220 B smaller (22%).")
         );
         // Switching off Best clears the decision and the written file. The sizes stay.
         jpeg.recommendation = None;
         jpeg.output_bytes = None;
         assert_eq!(
-            webp_savings_line(&jpeg, false, false).as_deref(),
+            webp_savings_line(&jpeg, false, false, None).as_deref(),
             Some("WebP would be 220 B smaller (22%).")
         );
 
@@ -3420,22 +3569,22 @@ mod tests {
             (Encode::Webp(WebpMode::Lossy), 920),
         ]);
         assert_eq!(
-            webp_savings_line(&jpeg, false, false).as_deref(),
+            webp_savings_line(&jpeg, false, false, None).as_deref(),
             Some("WebP would be 80 B smaller (8%).")
         );
         jpeg.measured = Some(vec![
             (Encode::Jpeg, 1000),
             (Encode::Webp(WebpMode::Lossy), 921),
         ]);
-        assert_eq!(webp_savings_line(&jpeg, false, false), None);
-        assert_eq!(webp_savings_line(&jpeg, true, false), None);
+        assert_eq!(webp_savings_line(&jpeg, false, false, None), None);
+        assert_eq!(webp_savings_line(&jpeg, true, false, None), None);
 
         jpeg.choice = RowChoice::Webp;
         jpeg.measured = Some(vec![
             (Encode::Jpeg, 1000),
             (Encode::Webp(WebpMode::Lossy), 780),
         ]);
-        assert_eq!(webp_savings_line(&jpeg, false, false), None);
+        assert_eq!(webp_savings_line(&jpeg, false, false, None), None);
 
         let mut png = sample_row("Done", true, RowChoice::Png);
         png.info.as_mut().unwrap().has_alpha = true;
@@ -3444,7 +3593,7 @@ mod tests {
             (Encode::Webp(WebpMode::Lossless), 780),
         ]);
         assert_eq!(
-            webp_savings_line(&png, false, false).as_deref(),
+            webp_savings_line(&png, false, false, None).as_deref(),
             Some("WebP would be 220 B smaller (22%).")
         );
 
@@ -3455,8 +3604,19 @@ mod tests {
             (Encode::Webp(WebpMode::Lossless), 780),
         ]);
         assert_eq!(
-            webp_savings_line(&flat, false, false).as_deref(),
+            webp_savings_line(&flat, false, false, None).as_deref(),
             Some("WebP keeps the transparency and is 220 B smaller (22%).")
+        );
+
+        jpeg.choice = RowChoice::Jpeg;
+        jpeg.measured = Some(vec![
+            (Encode::Jpeg, 1000),
+            (Encode::Webp(WebpMode::Lossy), 780),
+        ]);
+        assert_eq!(webp_savings_line(&jpeg, false, false, Some(900)), None);
+        assert_eq!(
+            webp_savings_line(&jpeg, false, false, Some(1000)).as_deref(),
+            Some("WebP would be 220 B smaller (22%).")
         );
     }
 
@@ -3474,10 +3634,8 @@ mod tests {
             image::Rgb([((x * 13 + y * 7) % 256) as u8, (x * 3) as u8, (y * 5) as u8])
         });
         let file = std::fs::File::create(&src).unwrap();
-        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-            std::io::BufWriter::new(file),
-            95,
-        );
+        let encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(std::io::BufWriter::new(file), 95);
         encoder
             .write_image(image.as_raw(), 48, 48, image::ExtendedColorType::Rgb8)
             .unwrap();
@@ -3529,7 +3687,13 @@ mod tests {
         image.save(&src).unwrap();
         let webp = dir.join("card.webp");
         let status = std::process::Command::new(&tools.cwebp)
-            .args(["-q", "80", src.to_str().unwrap(), "-o", webp.to_str().unwrap()])
+            .args([
+                "-q",
+                "80",
+                src.to_str().unwrap(),
+                "-o",
+                webp.to_str().unwrap(),
+            ])
             .status()
             .unwrap();
         assert!(status.success());

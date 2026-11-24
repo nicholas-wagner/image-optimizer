@@ -2,12 +2,19 @@ use crate::model::WebpMode;
 use crate::settings::Settings;
 use std::path::Path;
 
+/// Passes cwebp spends chasing `-size`. More than this is slow for little gain.
+pub const WEBP_SIZE_PASSES: u8 = 6;
+
 pub fn jpegoptim_args(settings: &Settings, input: &Path, dest_dir: &Path) -> Vec<String> {
     let mut args = vec![
         format!("--dest={}", dest_dir.display()),
         "--overwrite".to_string(),
     ];
-    if !settings.jpeg_lossless {
+    // `--size` searches quality on its own, down to 0. The caller keeps the
+    // quality floor by discarding a result that undershoots a `--max` encode.
+    if settings.max_file_kb > 0 && !settings.jpeg_lossless {
+        args.push(format!("--size={}k", settings.max_file_kb));
+    } else if !settings.jpeg_lossless {
         args.push(format!("--max={}", settings.jpeg_quality.min(100)));
     }
     if settings.jpeg_progressive {
@@ -25,6 +32,20 @@ pub fn jpegoptim_args(settings: &Settings, input: &Path, dest_dir: &Path) -> Vec
     }
     args.push(input.display().to_string());
     args
+}
+
+/// `--max` at one quality, with the same metadata flags and no size target.
+pub fn jpegoptim_at_quality(
+    settings: &Settings,
+    input: &Path,
+    dest_dir: &Path,
+    quality: u8,
+) -> Vec<String> {
+    let mut forced = settings.clone();
+    forced.jpeg_lossless = false;
+    forced.max_file_kb = 0;
+    forced.jpeg_quality = quality.min(100);
+    jpegoptim_args(&forced, input, dest_dir)
 }
 
 pub fn pngcrush_args(settings: &Settings, input: &Path, output: &Path) -> Vec<String> {
@@ -57,12 +78,17 @@ pub fn cwebp_args(settings: &Settings, mode: WebpMode, input: &Path, output: &Pa
         }
         WebpMode::Lossy => {
             // -preset overwrites other options except -q, so it comes first.
-            args.extend([
-                "-preset".to_string(),
-                "photo".to_string(),
-                "-q".to_string(),
-                settings.webp_quality.min(100).to_string(),
-            ]);
+            args.extend(["-preset".to_string(), "photo".to_string()]);
+            if settings.max_file_kb > 0 {
+                let bytes = u64::from(settings.max_file_kb) * 1024;
+                args.push("-size".to_string());
+                args.push(bytes.to_string());
+                args.push("-pass".to_string());
+                args.push(WEBP_SIZE_PASSES.to_string());
+            } else {
+                args.push("-q".to_string());
+                args.push(settings.webp_quality.min(100).to_string());
+            }
         }
     }
     args.push("-mt".to_string());
@@ -76,6 +102,20 @@ pub fn cwebp_args(settings: &Settings, mode: WebpMode, input: &Path, output: &Pa
     args.push("-o".to_string());
     args.push(output.display().to_string());
     args
+}
+
+/// `-q` at one quality. Lossless and the size target stay off.
+pub fn cwebp_at_quality(
+    settings: &Settings,
+    input: &Path,
+    output: &Path,
+    quality: u8,
+) -> Vec<String> {
+    let mut forced = settings.clone();
+    forced.webp_lossless = false;
+    forced.max_file_kb = 0;
+    forced.webp_quality = quality.min(100);
+    cwebp_args(&forced, WebpMode::Lossy, input, output)
 }
 
 pub fn display_command(program: &Path, args: &[String]) -> String {
@@ -193,5 +233,41 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "-lossless"));
         assert!(args.windows(2).any(|pair| pair == ["-z", "6"]));
         assert!(args.iter().any(|arg| arg == "-exact"));
+    }
+
+    #[test]
+    fn size_target_is_a_jpegoptim_kilobyte_goal_and_a_cwebp_byte_goal() {
+        let (input, dest) = paths();
+        let mut settings = Settings::default();
+        settings.max_file_kb = 1024;
+        let jpeg = jpegoptim_args(&settings, &input, &dest);
+        assert!(jpeg.iter().any(|arg| arg == "--size=1024k"));
+        assert!(!jpeg.iter().any(|arg| arg.starts_with("--max")));
+        let capped = jpegoptim_at_quality(&settings, &input, &dest, 60);
+        assert!(capped.iter().any(|arg| arg == "--max=60"));
+        assert!(!capped.iter().any(|arg| arg.starts_with("--size")));
+
+        let webp = cwebp_args(&settings, WebpMode::Lossy, &input, &dest);
+        assert!(webp.windows(2).any(|pair| pair == ["-size", "1048576"]));
+        assert!(webp
+            .windows(2)
+            .any(|pair| pair == ["-pass", &WEBP_SIZE_PASSES.to_string()]));
+        assert!(!webp.windows(2).any(|pair| pair[0] == "-q"));
+        let at_floor = cwebp_at_quality(&settings, &input, &dest, 60);
+        assert!(at_floor.windows(2).any(|pair| pair == ["-q", "60"]));
+        assert!(!at_floor.iter().any(|arg| arg == "-size"));
+
+        // PNG has no quality knob, and lossless modes must not chase a size.
+        let png = pngcrush_args(&settings, &input, &dest);
+        assert!(png.iter().any(|arg| arg == "-reduce"));
+        assert!(!png.iter().any(|arg| arg.contains("size")));
+        settings.jpeg_lossless = true;
+        settings.webp_lossless = true;
+        let lossless_jpeg = jpegoptim_args(&settings, &input, &dest);
+        assert!(!lossless_jpeg.iter().any(|arg| arg.starts_with("--size")));
+        assert!(!lossless_jpeg.iter().any(|arg| arg.starts_with("--max")));
+        let lossless_webp = cwebp_args(&settings, WebpMode::Lossless, &input, &dest);
+        assert!(!lossless_webp.iter().any(|arg| arg == "-size"));
+        assert!(lossless_webp.iter().any(|arg| arg == "-lossless"));
     }
 }

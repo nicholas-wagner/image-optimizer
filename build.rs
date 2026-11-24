@@ -14,7 +14,9 @@ fn main() {
 
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let bin = Path::new(&manifest).join("bin");
-    let ready = tool_names(windows).iter().all(|name| bin.join(name).is_file());
+    let ready = tool_names(windows)
+        .iter()
+        .all(|name| bin.join(name).is_file());
     let profile = std::env::var("PROFILE").unwrap_or_default();
 
     if profile == "release" {
