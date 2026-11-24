@@ -28,8 +28,12 @@ build_heif_dec() {
   fi
   if [ -n "$heif_exe" ]; then
     link_flags="-static -static-libstdc++ -static-libgcc"
+    # de265.h uses dllimport unless this is set. libde265's own build adds it;
+    # libheif has to add it too or the Windows link looks for a DLL.
+    static_defs="-DCMAKE_C_FLAGS=-DLIBDE265_STATIC_BUILD -DCMAKE_CXX_FLAGS=-DLIBDE265_STATIC_BUILD"
   else
     link_flags="-static-libstdc++ -static-libgcc"
+    static_defs=
   fi
 
   fetch "https://github.com/strukturag/libde265/releases/download/v${de265_ver}/libde265-${de265_ver}.tar.gz" \
@@ -72,6 +76,7 @@ build_heif_dec() {
     cmake -S "$third/libheif-${heif_ver}" -B "$third/libheif-build$suffix" \
       $toolchain_arg \
       $compiler_args \
+      $static_defs \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_INSTALL_PREFIX="$heif_prefix" \
       -DCMAKE_INSTALL_LIBDIR=lib \
