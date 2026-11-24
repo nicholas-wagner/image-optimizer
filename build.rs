@@ -29,7 +29,7 @@ fn main() {
 }
 
 fn tool_names(windows: bool) -> Vec<String> {
-    ["jpegoptim", "pngcrush", "cwebp"]
+    ["jpegoptim", "pngcrush", "cwebp", "heif-dec"]
         .into_iter()
         .map(|name| {
             if windows {

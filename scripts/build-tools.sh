@@ -1,6 +1,6 @@
 #!/bin/sh
-# Builds jpegoptim and pngcrush, and downloads the official static cwebp, into bin/.
-# Needs: curl, tar, gcc, make, cmake. A system libz.a is used when one is
+# Builds jpegoptim, pngcrush, and heif-dec, and downloads the official static cwebp, into bin/.
+# Needs: curl, tar, gcc, g++, make, cmake. A system libz.a is used when one is
 # installed; otherwise a static zlib is built here.
 set -eu
 
@@ -142,6 +142,13 @@ python3 "$root/scripts/patch-pngcrush.py" "$src"
     LIBS="$png_a $zlib_a -lm"
 )
 cp -a "$third/pngcrush-src/pngcrush-1.8.13-nolib/pngcrush" "$bin/pngcrush"
+
+png_inc="$third/png-install/include"
+heif_toolchain=
+heif_exe=
+. "$root/scripts/build-heif-dec.sh"
+build_heif_dec
+
 mkdir -p "$root/lib"
 fetch_deb() {
   pkg=$1
@@ -163,6 +170,6 @@ fetch_deb() {
 fetch_deb libxkbcommon-x11-0 "libxkbcommon-x11.so.0.0.0" "$root/lib/libxkbcommon-x11.so.0"
 fetch_deb libxcb-xkb1 "libxcb-xkb.so.1.0.0" "$root/lib/libxcb-xkb.so.1"
 
-chmod +x "$bin/jpegoptim" "$bin/pngcrush" "$bin/cwebp"
+chmod +x "$bin/jpegoptim" "$bin/pngcrush" "$bin/cwebp" "$bin/heif-dec"
 echo "tools in $bin"
-ls -lh "$bin/jpegoptim" "$bin/pngcrush" "$bin/cwebp"
+ls -lh "$bin/jpegoptim" "$bin/pngcrush" "$bin/cwebp" "$bin/heif-dec"

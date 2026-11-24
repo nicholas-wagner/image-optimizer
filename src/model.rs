@@ -16,6 +16,8 @@ pub enum SourceFormat {
     Jpeg,
     Png,
     Webp,
+    /// iPhone HEIC or HEIF. Decoded before the rest of the pipeline. Never written.
+    Heif,
 }
 
 impl SourceFormat {
@@ -24,6 +26,7 @@ impl SourceFormat {
             Self::Jpeg => "JPEG",
             Self::Png => "PNG",
             Self::Webp => "WebP",
+            Self::Heif => "HEIC",
         }
     }
 }
@@ -159,7 +162,7 @@ pub fn is_photo(format: SourceFormat, has_alpha: bool, color_count: Option<u32>)
         return false;
     }
     match format {
-        SourceFormat::Jpeg => true,
+        SourceFormat::Jpeg | SourceFormat::Heif => true,
         SourceFormat::Png | SourceFormat::Webp => {
             color_count.map(|count| count > 256).unwrap_or(true)
         }
@@ -372,6 +375,8 @@ mod tests {
     #[test]
     fn photo_detection() {
         assert!(is_photo(SourceFormat::Jpeg, false, None));
+        assert!(is_photo(SourceFormat::Heif, false, None));
+        assert!(!is_photo(SourceFormat::Heif, true, None));
         assert!(!is_photo(SourceFormat::Png, true, Some(10_000)));
         assert!(is_photo(SourceFormat::Png, false, Some(257)));
         assert!(!is_photo(SourceFormat::Png, false, Some(256)));
@@ -498,6 +503,22 @@ mod tests {
         assert_eq!(
             pick(100, true, &[(Encode::Jpeg, 200)], Some(50)),
             Decision::Keep
+        );
+    }
+
+    #[test]
+    fn heic_photos_save_as_jpeg_and_alpha_saves_as_png() {
+        let (photo, encodes) =
+            encodes_for(SourceFormat::Heif, false, None, 4000, 3000, false, true);
+        assert!(photo);
+        assert_eq!(encodes, vec![Encode::Jpeg, Encode::Webp(WebpMode::Lossy)]);
+
+        let (alpha, alpha_encodes) =
+            encodes_for(SourceFormat::Heif, true, None, 400, 300, false, true);
+        assert!(!alpha);
+        assert_eq!(
+            alpha_encodes,
+            vec![Encode::Png, Encode::Webp(WebpMode::Lossless)]
         );
     }
 

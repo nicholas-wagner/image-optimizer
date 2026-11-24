@@ -1,6 +1,6 @@
 # Image Optimizer
 
-One file. Nothing to install. It optimizes JPEG, PNG, and WebP with the real `jpegoptim`, `pngcrush`, and `cwebp` tools, which are packed inside the app.
+One file. Nothing to install. It optimizes JPEG, PNG, and WebP with the real `jpegoptim`, `pngcrush`, and `cwebp` tools, which are packed inside the app. iPhone photos (HEIC) can be added too. They are saved as JPEG, or as PNG when the photo has transparency. The app does not write HEIC.
 
 ## Use it
 
@@ -8,7 +8,7 @@ Linux / WSL: run `./image-optimizer`. The window opens in **Simple**.
 
 1. Pick a style. **Smaller file** keeps the full size. **For the web** shrinks the long side to 1600 px. **For email** shrinks the long side to 1200 px and saves JPEG or PNG only. **Perfect quality** does not reduce quality. **Smallest PNG** saves every file as PNG with maximum compression. That one is slow.
 2. Optional: set **Max size per file**. It starts on **Off**. The other choices are 500 KB, 1 MB, 2 MB, and 5 MB. Advanced can type a different KB value. Each file is handled on its own.
-3. Click **Add images** at the bottom, or drop files onto the window.
+3. Click **Add images** at the bottom, or drop files onto the window. iPhone photos work the same as JPEG. If a folder also contains files this app cannot use, one line says what was left out, for example: Skipped 3 files: 2 GIF, 1 video.
 4. Click **Optimize**.
 
 Originals stay untouched. Results land in an `optimized` folder next to the first image. Click a file to compare before and after. The same button stays at the bottom while you scroll.
@@ -19,7 +19,7 @@ Originals stay untouched. Results land in an `optimized` folder next to the firs
 
 Windows: run `image-optimizer.exe`. It uses the normal Windows file dialog.
 
-The first launch unpacks the three tools into `~/.cache/image-optimizer/bin/`. If `libxkbcommon-x11` or `libxcb-xkb` is missing, it also unpacks that library into `~/.cache/image-optimizer/lib/`. You do not place those files yourself.
+The first launch unpacks the tools into `~/.cache/image-optimizer/bin/`. If `libxkbcommon-x11` or `libxcb-xkb` is missing, it also unpacks that library into `~/.cache/image-optimizer/lib/`. You do not place those files yourself.
 
 ## Defaults
 
@@ -59,8 +59,8 @@ Windows, about 15 minutes, needs Docker:
 
 ## Licenses
 
-The download is one file. The GUI is MIT. jpegoptim, pngcrush, and cwebp are stored inside that file and run as separate programs.
+The download is one file. The GUI is MIT. jpegoptim, pngcrush, cwebp, and heif-dec are stored inside that file and run as separate programs.
 
 jpegoptim is GPL-3.0-or-later. Its corresponding source is jpegoptim 1.5.6 and libjpeg-turbo 3.0.4, built by the scripts in this repository. This software is based in part on the work of the Independent JPEG Group.
 
-pngcrush 1.8.13 is modified: the Adler32 option is compiled only when libpng still provides it. cwebp is the unmodified libwebp 1.6.0 binary. Linux may also unpack libxkbcommon-x11 and libxcb-xkb. Open Licenses in the app for the full texts.
+pngcrush 1.8.13 is modified: the Adler32 option is compiled only when libpng still provides it. cwebp is the unmodified libwebp 1.6.0 binary. heif-dec is the libheif 1.23.7 example, statically linked with libde265 1.1.3. Both of those libraries are LGPL-3.0-or-later. Linux may also unpack libxkbcommon-x11 and libxcb-xkb. Open Licenses in the app for the full texts.

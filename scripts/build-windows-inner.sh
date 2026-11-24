@@ -141,6 +141,15 @@ else
   cp -a "$third/pngcrush-src/pngcrush-1.8.13-nolib/pngcrush" "$root/bin/pngcrush.exe"
 fi
 
+heif_toolchain="$third/mingw-toolchain.cmake"
+heif_exe=".exe"
+png_a="$prefix/lib/libpng.a"
+png_inc="$prefix/include"
+zlib_a="$prefix/lib/libz.a"
+zlib_inc="$prefix/include"
+. "$root/scripts/build-heif-dec.sh"
+build_heif_dec
+
 fetch "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0-windows-x64.zip" \
   "$third/libwebp-windows.zip"
 if [ ! -f "$root/bin/cwebp.exe" ]; then
@@ -151,9 +160,16 @@ if [ ! -f "$root/bin/cwebp.exe" ]; then
 fi
 
 echo "=== tool DLL dependencies ==="
-for exe in jpegoptim.exe pngcrush.exe cwebp.exe; do
+for exe in jpegoptim.exe pngcrush.exe cwebp.exe heif-dec.exe; do
   echo "-- $exe"
   x86_64-w64-mingw32-objdump -p "$root/bin/$exe" | awk '/DLL Name/{print}'
+done
+heif_dlls=$(x86_64-w64-mingw32-objdump -p "$root/bin/heif-dec.exe" | awk '/DLL Name/{print tolower($3)}')
+for banned in libheif libde265 libpng zlib libstdc++ libgcc libwinpthread libgcc_s; do
+  if printf '%s\n' "$heif_dlls" | grep -q "$banned"; then
+    echo "heif-dec.exe depends on $banned" >&2
+    exit 1
+  fi
 done
 
 cargo build --release --target x86_64-pc-windows-gnu

@@ -21,7 +21,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-This download is one file. Release builds store jpegoptim, pngcrush, and cwebp inside that file and unpack them before running them. The GUI does not link those programs. It starts each one as its own process.
+This download is one file. Release builds store jpegoptim, pngcrush, cwebp, and heif-dec inside that file and unpack them before running them. The GUI does not link those programs. It starts each one as its own process.
 
 jpegoptim 1.5.6
 Copyright (C) 1996-2022 Timo Kokkonen
@@ -58,6 +58,17 @@ This is the unmodified official binary.
 Linux: https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0-linux-x86-64.tar.gz
 Windows: https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0-windows-x64.zip
 The BSD license and the additional patent grant follow this summary.
+
+heif-dec from libheif 1.23.7
+The example program heif-dec is MIT. The libheif library is GNU LGPL version 3 or later.
+This copy is statically linked with libde265 1.1.3, also GNU LGPL version 3 or later, and with libpng 1.6.44 and zlib 1.3.1.
+It decodes iPhone HEIC and HEIF photos so they can be saved as JPEG or PNG. This app does not write HEIC.
+libheif: https://github.com/strukturag/libheif/releases/download/v1.23.7/libheif-1.23.7.tar.gz
+libde265: https://github.com/strukturag/libde265/releases/download/v1.1.3/libde265-1.1.3.tar.gz
+The build commands are scripts/build-tools.sh on Linux and scripts/build-windows-inner.sh on Windows, in
+https://github.com/nicholas-wagner/image-optimizer
+at the same version tag as this app.
+The LGPL text, which covers both libraries, and the MIT notice for heif-dec follow this summary.
 
 On Linux, if libxkbcommon-x11.so.0 or libxcb-xkb.so.1 is missing, this app unpacks copies of those libraries and loads them into the GUI process. Their notices follow this summary.
 libxkbcommon: https://xkbcommon.org/

@@ -6,6 +6,7 @@ mod bootstrap;
 mod commands;
 mod execute;
 mod files;
+mod heif;
 mod licenses;
 mod model;
 mod settings;
