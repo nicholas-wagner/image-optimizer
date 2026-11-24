@@ -143,6 +143,7 @@ fi
 
 heif_toolchain="$third/mingw-toolchain.cmake"
 heif_exe=".exe"
+bin="$root/bin"
 png_a="$prefix/lib/libpng.a"
 png_inc="$prefix/include"
 zlib_a="$prefix/lib/libz.a"
