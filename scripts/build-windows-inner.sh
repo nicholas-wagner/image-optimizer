@@ -10,7 +10,7 @@ else
   apt_get() { sudo apt-get "$@"; }
 fi
 apt_get update
-apt_get install -y gcc-mingw-w64-x86-64 cmake make curl unzip python3 xz-utils pkg-config
+apt_get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 cmake make curl unzip python3 xz-utils pkg-config
 
 rustup target add x86_64-pc-windows-gnu
 
@@ -32,6 +32,7 @@ cat > "$third/mingw-toolchain.cmake" <<EOF
 set(CMAKE_SYSTEM_NAME Windows)
 set(CMAKE_SYSTEM_PROCESSOR x86_64)
 set(CMAKE_C_COMPILER x86_64-w64-mingw32-gcc)
+set(CMAKE_CXX_COMPILER x86_64-w64-mingw32-g++)
 set(CMAKE_RC_COMPILER x86_64-w64-mingw32-windres)
 set(CMAKE_FIND_ROOT_PATH ${prefix})
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
