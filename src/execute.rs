@@ -99,8 +99,9 @@ pub fn recommend_file(
     info: &ImageInfo,
     cancel: &CancelFlag,
 ) -> Result<Recommendation, String> {
-    let (has_alpha, color_count) = if info.format == SourceFormat::Jpeg {
-        (false, None)
+    let (has_alpha, color_count) = if matches!(info.format, SourceFormat::Jpeg | SourceFormat::Heif)
+    {
+        (info.has_alpha, None)
     } else {
         let image = image::open(src).map_err(|err| err.to_string())?;
         let (alpha, count) = analyze::scan_image(&image, 256);
@@ -184,6 +185,7 @@ fn encode_one(
     }
     fs::create_dir_all(output_dir).map_err(|err| err.to_string())?;
     let final_path = output_dir.join(output_name(src, encode));
+    refuse_heif_output(&final_path)?;
     if same_file(src, &final_path) {
         return Err("Refusing to overwrite the original".to_string());
     }
@@ -207,7 +209,9 @@ fn encode_one(
         );
     }
     let mut note = String::new();
-    let input = materialize_input(src, info, settings, encode, &scratch, None, &mut note)?;
+    let input = materialize_input(
+        tools, src, info, settings, encode, &scratch, None, cancel, &mut note,
+    )?;
     if same_file(src, &final_path) {
         return Err("Refusing to overwrite the original".to_string());
     }
@@ -358,12 +362,14 @@ fn encode_attempt(
     fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
     let mut note = String::new();
     let input = materialize_input(
+        job.tools,
         job.src,
         job.info,
         job.settings,
         job.encode,
         job.scratch,
         edge,
+        job.cancel,
         &mut note,
     )?;
     let run = match job.encode {
@@ -530,12 +536,14 @@ fn run_webp(
 }
 
 fn materialize_input(
+    tools: &ToolPaths,
     src: &Path,
     info: &ImageInfo,
     settings: &Settings,
     encode: Encode,
     scratch: &Scratch,
     edge: Option<u32>,
+    cancel: &CancelFlag,
     note: &mut String,
 ) -> Result<PathBuf, String> {
     // `Some` is a forced long side (the size loop). `None` keeps the resize checkbox.
@@ -544,7 +552,20 @@ fn materialize_input(
         None if settings.resize_enabled => Some(settings.resize_max_edge),
         None => None,
     };
-    let pass_through = resize_edge.is_none()
+    let from_heif = info.format == SourceFormat::Heif;
+    // HEIC is decoded to a PNG first. JPEG output is written from those pixels.
+    // PNG and WebP can use the decoded file directly when nothing is resized.
+    let work = if from_heif {
+        let decoded = decoded_heif_png(tools, src, scratch, cancel)?;
+        if resize_edge.is_none() && !matches!(encode, Encode::Jpeg) {
+            return Ok(decoded);
+        }
+        decoded
+    } else {
+        src.to_path_buf()
+    };
+    let pass_through = !from_heif
+        && resize_edge.is_none()
         && match encode {
             Encode::Jpeg => info.format == SourceFormat::Jpeg,
             Encode::Png => info.format == SourceFormat::Png,
@@ -554,7 +575,7 @@ fn materialize_input(
         return Ok(src.to_path_buf());
     }
 
-    let (image, profile) = load_image(src)?;
+    let (image, profile, exif) = load_meta(&work, from_heif)?;
     let (width, height) = (image.width(), image.height());
     let image = if let Some(edge) = resize_edge {
         let (nw, nh) = model::fit(width, height, edge);
@@ -574,7 +595,13 @@ fn materialize_input(
                 push_note(note, "alpha flattened onto white");
             }
             let path = scratch.path.join("input.jpg");
-            write_jpeg(&image, &path, 100, profile.as_deref())?;
+            write_jpeg(
+                &image,
+                &path,
+                100,
+                profile.as_deref(),
+                if from_heif { exif.as_deref() } else { None },
+            )?;
             Ok(path)
         }
         Encode::Png | Encode::Webp(_) => {
@@ -585,10 +612,33 @@ fn materialize_input(
     }
 }
 
+fn decoded_heif_png(
+    tools: &ToolPaths,
+    src: &Path,
+    scratch: &Scratch,
+    cancel: &CancelFlag,
+) -> Result<PathBuf, String> {
+    let dest = scratch.path.join("heif-decoded.png");
+    if dest.is_file() {
+        return Ok(dest);
+    }
+    let args = crate::heif::decode_args(src, &dest);
+    run_tool(cancel, &tools.heif_dec, &args)?;
+    if !dest.is_file() {
+        return Err("heif-dec did not write a PNG".to_string());
+    }
+    Ok(dest)
+}
+
 /// Decode pixels, apply the Exif orientation, and keep the ICC profile.
 /// Stripping metadata later can drop the orientation tag. The pixels are
 /// turned upright first, and the profile stays with them so colors do not shift.
-fn load_image(path: &Path) -> Result<(DynamicImage, Option<Vec<u8>>), String> {
+/// `keep_exif` is set for a decoded HEIC photo so location data survives until
+/// a style that strips metadata removes it.
+fn load_meta(
+    path: &Path,
+    keep_exif: bool,
+) -> Result<(DynamicImage, Option<Vec<u8>>, Option<Vec<u8>>), String> {
     let reader = image::ImageReader::open(path)
         .map_err(|err| err.to_string())?
         .with_guessed_format()
@@ -599,12 +649,21 @@ fn load_image(path: &Path) -> Result<(DynamicImage, Option<Vec<u8>>), String> {
         .ok()
         .flatten()
         .filter(|bytes| !bytes.is_empty());
+    let exif = if keep_exif {
+        decoder
+            .exif_metadata()
+            .ok()
+            .flatten()
+            .filter(|bytes| !bytes.is_empty())
+    } else {
+        None
+    };
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
     let mut image = DynamicImage::from_decoder(decoder).map_err(|err| err.to_string())?;
     image.apply_orientation(orientation);
-    Ok((image, profile))
+    Ok((image, profile, exif))
 }
 
 fn write_jpeg(
@@ -612,6 +671,7 @@ fn write_jpeg(
     path: &Path,
     quality: u8,
     icc: Option<&[u8]>,
+    exif: Option<&[u8]>,
 ) -> Result<(), String> {
     // JpegEncoder has no subsampling control. It writes 4:4:4. A later
     // lossy jpegoptim --max recompresses that to libjpeg's default 4:2:0.
@@ -621,6 +681,11 @@ fn write_jpeg(
     if let Some(profile) = icc {
         encoder
             .set_icc_profile(profile.to_vec())
+            .map_err(|err| err.to_string())?;
+    }
+    if let Some(exif) = exif {
+        encoder
+            .set_exif_metadata(exif.to_vec())
             .map_err(|err| err.to_string())?;
     }
     encoder
@@ -687,7 +752,8 @@ pub fn effective_encode(
             Some(Decision::Use(encode)) => encode,
             None => match format {
                 SourceFormat::Jpeg => Encode::Jpeg,
-                SourceFormat::Png => Encode::Png,
+                SourceFormat::Heif if !has_alpha => Encode::Jpeg,
+                SourceFormat::Heif | SourceFormat::Png => Encode::Png,
                 SourceFormat::Webp => Encode::Webp(model::webp_chip_mode(has_alpha, webp_lossless)),
             },
         },
@@ -708,6 +774,14 @@ fn without_webp(encode: Encode, format: SourceFormat, has_alpha: bool) -> Encode
     } else {
         Encode::Jpeg
     }
+}
+
+fn refuse_heif_output(path: &Path) -> Result<(), String> {
+    let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    if ext.eq_ignore_ascii_case("heic") || ext.eq_ignore_ascii_case("heif") {
+        return Err("Refusing to write a HEIC file".to_string());
+    }
+    Ok(())
 }
 
 fn same_file(left: &Path, right: &Path) -> bool {
@@ -841,6 +915,33 @@ mod tests {
             output_name(Path::new("/tmp/Photo.jpg"), Encode::Webp(WebpMode::Lossy)),
             "Photo.webp"
         );
+    }
+
+    #[test]
+    fn heic_output_names_are_never_heic() {
+        for encode in [
+            Encode::Jpeg,
+            Encode::Png,
+            Encode::Webp(WebpMode::Lossy),
+            Encode::Webp(WebpMode::Lossless),
+        ] {
+            for source in ["IMG_0001.HEIC", "IMG_0001.heif", "IMG_0001.Heic"] {
+                let name = output_name(Path::new(source), encode);
+                let lower = name.to_ascii_lowercase();
+                assert!(!lower.ends_with(".heic"), "{name}");
+                assert!(!lower.ends_with(".heif"), "{name}");
+            }
+        }
+        assert_eq!(
+            output_name(Path::new("/tmp/IMG_0001.HEIC"), Encode::Jpeg),
+            "IMG_0001.jpg"
+        );
+        assert_eq!(
+            output_name(Path::new("/tmp/IMG_0001.heif"), Encode::Png),
+            "IMG_0001.png"
+        );
+        assert!(refuse_heif_output(Path::new("out.heic")).is_err());
+        assert!(refuse_heif_output(Path::new("out.jpg")).is_ok());
     }
 
     fn write_jpeg_fixture(path: &Path, quality: u8) {
@@ -1828,6 +1929,128 @@ mod tests {
             outcome.output_bytes,
             floor_edge.output_bytes
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn heic_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/fixtures/iphone.heic")
+    }
+
+    fn no_heic_outputs(dir: &Path) {
+        let found = std::fs::read_dir(dir).unwrap().any(|entry| {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy().to_ascii_lowercase();
+            name.ends_with(".heic") || name.ends_with(".heif")
+        });
+        assert!(!found, "a HEIC file was written in {}", dir.display());
+    }
+
+    #[test]
+    fn iphone_heic_becomes_an_upright_jpeg_with_its_color_profile() {
+        let Some(tools) = tools() else {
+            return;
+        };
+        let src = heic_fixture();
+        let bytes = fs::read(&src).unwrap();
+        assert_eq!(
+            analyze::sniff(&bytes[..64.min(bytes.len())]),
+            Some(SourceFormat::Heif)
+        );
+        assert!(
+            bytes.windows(11).any(|window| window == b"GPSLatitude"),
+            "fixture should carry a location tag"
+        );
+        let info = analyze::analyze(&src).unwrap();
+        assert_eq!(info.format, SourceFormat::Heif);
+        assert!(!info.has_alpha);
+        // Stored sideways (64x32) with a 90 degree turn. Display size is upright.
+        assert_eq!((info.width, info.height), (32, 64));
+
+        let dir = std::env::temp_dir().join(format!("io-heic-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let icc = fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/fixtures/srgb.icc"))
+            .unwrap();
+
+        let email = crate::settings::Preset::Email.baseline();
+        let out = dir.join("email");
+        let outcome = optimize_file(
+            &tools,
+            &email,
+            &src,
+            &info,
+            Encode::Jpeg,
+            &out,
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.output_path.extension().and_then(|ext| ext.to_str()),
+            Some("jpg")
+        );
+        assert_eq!(
+            image::image_dimensions(&outcome.output_path).unwrap(),
+            (32, 64)
+        );
+        let turned = image::open(&outcome.output_path).unwrap().to_rgb8();
+        let top = turned.get_pixel(16, 8).0;
+        let bottom = turned.get_pixel(16, 48).0;
+        assert!(
+            top[0] > 200 && top[2] < 80,
+            "top should be red, got {top:?}"
+        );
+        assert!(
+            bottom[2] > 200 && bottom[0] < 80,
+            "bottom should be blue, got {bottom:?}"
+        );
+        assert_eq!(
+            icc_profile(&outcome.output_path).as_deref(),
+            Some(icc.as_slice())
+        );
+        let output = fs::read(&outcome.output_path).unwrap();
+        assert!(!output.windows(11).any(|window| window == b"GPSLatitude"));
+        no_heic_outputs(&out);
+        assert!(outcome.commands.iter().any(|cmd| cmd.contains("jpegoptim")));
+
+        let mut keep = Settings::default();
+        let kept = optimize_file(
+            &tools,
+            &keep,
+            &src,
+            &info,
+            Encode::Jpeg,
+            &dir.join("keep"),
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            icc_profile(&kept.output_path).as_deref(),
+            Some(icc.as_slice())
+        );
+        assert!(fs::read(&kept.output_path)
+            .unwrap()
+            .windows(11)
+            .any(|window| window == b"GPSLatitude"));
+        no_heic_outputs(&dir.join("keep"));
+
+        keep.max_file_kb = 500;
+        let fitted = optimize_file(
+            &tools,
+            &keep,
+            &src,
+            &info,
+            Encode::Jpeg,
+            &dir.join("fit"),
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert!(fitted.output_bytes <= 500 * 1024);
+        assert!(fitted.note.contains("fits under"), "{}", fitted.note);
+        assert_eq!(
+            fitted.output_path.extension().and_then(|ext| ext.to_str()),
+            Some("jpg")
+        );
+        no_heic_outputs(&dir.join("fit"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

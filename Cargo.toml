@@ -1,9 +1,9 @@
 [package]
 name = "image-optimizer"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 license = "MIT"
-description = "Portable GUI that optimizes images with jpegoptim, pngcrush, and cwebp"
+description = "Portable GUI that optimizes images with jpegoptim, pngcrush, cwebp, and heif-dec"
 publish = false
 
 [dependencies]

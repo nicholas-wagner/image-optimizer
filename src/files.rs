@@ -4,8 +4,10 @@
 //! cycle (easy to hit under WSL and in home directories) cannot recurse
 //! forever and overflow the stack.
 
-use std::collections::HashSet;
-use std::fs;
+use crate::analyze;
+use std::collections::{BTreeMap, HashSet};
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const MAX_IMAGES: usize = 2000;
@@ -36,12 +38,65 @@ pub struct DirItem {
 
 pub fn is_image_ext(path: &Path) -> bool {
     matches!(
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_ascii_lowercase())
-            .as_deref(),
-        Some("jpg" | "jpeg" | "png" | "webp")
+        extension(path).as_deref(),
+        Some("jpg" | "jpeg" | "png" | "webp" | "heic" | "heif")
     )
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Intake {
+    pub images: Vec<PathBuf>,
+    pub skipped: BTreeMap<String, usize>,
+}
+
+pub fn collect_intake(path: &Path) -> Intake {
+    collect_intake_limited(path, MAX_IMAGES)
+}
+
+pub fn collect_intake_limited(path: &Path, max: usize) -> Intake {
+    let mut intake = Intake::default();
+    let mut seen = HashSet::new();
+    walk(path, &mut intake, &mut seen, 0, max);
+    intake
+}
+
+/// One line such as `Skipped 3 files: 2 GIF, 1 video.`
+pub fn skipped_summary(skipped: &BTreeMap<String, usize>) -> Option<String> {
+    let total: usize = skipped.values().copied().sum();
+    if total == 0 {
+        return None;
+    }
+    let mut rows: Vec<(&str, usize)> = skipped
+        .iter()
+        .map(|(label, count)| (label.as_str(), *count))
+        .collect();
+    rows.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    let parts: Vec<String> = rows
+        .iter()
+        .map(|(label, count)| format!("{count} {label}"))
+        .collect();
+    let noun = if total == 1 { "file" } else { "files" };
+    Some(format!("Skipped {total} {noun}: {}.", parts.join(", ")))
+}
+
+/// Status line after an add. `found_images` is true when a supported file was seen,
+/// including one that was already in the list.
+pub fn intake_notice(
+    added: usize,
+    found_images: bool,
+    skipped: &BTreeMap<String, usize>,
+) -> String {
+    let mut parts = Vec::new();
+    if added > 0 {
+        let noun = if added == 1 { "image" } else { "images" };
+        parts.push(format!("Added {added} {noun}."));
+    } else if found_images || skipped.is_empty() {
+        parts.push("Those images are already in the list.".to_string());
+    }
+    if let Some(line) = skipped_summary(skipped) {
+        parts.push(line);
+    }
+    parts.join(" ")
 }
 
 pub fn starting_dir() -> PathBuf {
@@ -88,7 +143,7 @@ pub fn list_dir(dir: &Path) -> Result<Vec<DirItem>, String> {
         }
         let path = entry.path();
         let is_dir = path.is_dir();
-        if !is_dir && !is_image_ext(&path) {
+        if !is_dir && !is_supported_file(&path) {
             continue;
         }
         items.push(DirItem {
@@ -111,14 +166,11 @@ pub fn collect_images(path: &Path) -> Vec<PathBuf> {
 }
 
 pub fn collect_images_limited(path: &Path, max: usize) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    walk(path, &mut out, &mut seen, 0, max);
-    out
+    collect_intake_limited(path, max).images
 }
 
-fn walk(path: &Path, out: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, depth: u32, max: usize) {
-    if out.len() >= max || depth > MAX_DEPTH {
+fn walk(path: &Path, intake: &mut Intake, seen: &mut HashSet<PathBuf>, depth: u32, max: usize) {
+    if intake.images.len() >= max || depth > MAX_DEPTH {
         return;
     }
     let meta = match fs::symlink_metadata(path) {
@@ -133,9 +185,9 @@ fn walk(path: &Path, out: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, depth:
             return;
         }
         if target.is_dir() {
-            read_children(&target, out, seen, depth + 1, max);
-        } else if is_image_ext(&target) {
-            out.push(target);
+            read_children(&target, intake, seen, depth + 1, max);
+        } else {
+            consider_file(path, intake, max);
         }
         return;
     }
@@ -144,17 +196,15 @@ fn walk(path: &Path, out: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, depth:
         if !seen.insert(key) {
             return;
         }
-        read_children(path, out, seen, depth + 1, max);
+        read_children(path, intake, seen, depth + 1, max);
         return;
     }
-    if is_image_ext(path) {
-        out.push(path.to_path_buf());
-    }
+    consider_file(path, intake, max);
 }
 
 fn read_children(
     dir: &Path,
-    out: &mut Vec<PathBuf>,
+    intake: &mut Intake,
     seen: &mut HashSet<PathBuf>,
     depth: u32,
     max: usize,
@@ -164,15 +214,95 @@ fn read_children(
         Err(_) => return,
     };
     for entry in entries.flatten() {
-        if out.len() >= max {
+        if intake.images.len() >= max {
             return;
         }
         let name = entry.file_name();
         if name.to_string_lossy().starts_with('.') {
             continue;
         }
-        walk(&entry.path(), out, seen, depth, max);
+        walk(&entry.path(), intake, seen, depth, max);
     }
+}
+
+fn consider_file(path: &Path, intake: &mut Intake, max: usize) {
+    if is_supported_file(path) {
+        if intake.images.len() < max {
+            intake.images.push(path.to_path_buf());
+        }
+        return;
+    }
+    let label = skip_label(path);
+    *intake.skipped.entry(label).or_default() += 1;
+}
+
+fn is_supported_file(path: &Path) -> bool {
+    is_image_ext(path) || sniff_header(path).is_some()
+}
+
+fn sniff_header(path: &Path) -> Option<crate::model::SourceFormat> {
+    let mut file = File::open(path).ok()?;
+    let mut header = [0u8; 64];
+    let read = file.read(&mut header).ok()?;
+    analyze::sniff(&header[..read])
+}
+
+fn extension(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+}
+
+fn skip_label(path: &Path) -> String {
+    if let Some(kind) = signature_kind(path) {
+        return kind;
+    }
+    match extension(path).as_deref() {
+        Some("gif") => "GIF".to_string(),
+        Some(ext) if is_video_ext(ext) => "video".to_string(),
+        Some(ext) if is_text_ext(ext) => "text".to_string(),
+        Some(ext) if ext.len() <= 4 && ext.chars().all(|ch| ch.is_ascii_alphanumeric()) => {
+            ext.to_ascii_uppercase()
+        }
+        _ => "other".to_string(),
+    }
+}
+
+fn signature_kind(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let mut header = [0u8; 16];
+    let read = file.read(&mut header).ok()?;
+    let header = &header[..read];
+    if header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a") {
+        return Some("GIF".to_string());
+    }
+    None
+}
+
+fn is_video_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "mp4"
+            | "m4v"
+            | "mov"
+            | "avi"
+            | "mkv"
+            | "webm"
+            | "wmv"
+            | "mpg"
+            | "mpeg"
+            | "3gp"
+            | "3g2"
+            | "ogv"
+            | "ts"
+            | "mts"
+            | "qt"
+            | "flv"
+    )
+}
+
+fn is_text_ext(ext: &str) -> bool {
+    matches!(ext, "txt" | "text" | "md" | "csv" | "rtf" | "log")
 }
 
 #[cfg(test)]
@@ -248,6 +378,54 @@ mod tests {
         let found = collect_images(&dir);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].file_name().unwrap(), "only.webp");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heic_extension_and_signature_are_images() {
+        assert!(is_image_ext(Path::new("IMG_0001.HEIC")));
+        assert!(is_image_ext(Path::new("photo.heif")));
+        assert!(!is_image_ext(Path::new("clip.mp4")));
+        let dir = scratch("heic-sig");
+        let mut header = vec![0u8; 24];
+        header[0..4].copy_from_slice(&24u32.to_be_bytes());
+        header[4..8].copy_from_slice(b"ftyp");
+        header[8..12].copy_from_slice(b"heic");
+        header[16..20].copy_from_slice(b"mif1");
+        fs::write(dir.join("phone.bin"), &header).unwrap();
+        fs::write(dir.join("shot.HEIC"), &header).unwrap();
+        let found = collect_images(&dir);
+        let mut names: Vec<_> = found
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["phone.bin", "shot.HEIC"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skipped_files_are_counted_by_type() {
+        let dir = scratch("skip");
+        fs::write(dir.join("a.jpg"), b"x").unwrap();
+        fs::write(dir.join("b.gif"), b"GIF89a").unwrap();
+        fs::write(dir.join("c.GIF"), b"GIF87a").unwrap();
+        fs::write(dir.join("clip.mp4"), b"not-really").unwrap();
+        fs::write(dir.join(".hidden.gif"), b"GIF89a").unwrap();
+        let intake = collect_intake(&dir);
+        assert_eq!(intake.images.len(), 1);
+        assert_eq!(
+            skipped_summary(&intake.skipped).as_deref(),
+            Some("Skipped 3 files: 2 GIF, 1 video.")
+        );
+        assert_eq!(
+            intake_notice(1, true, &intake.skipped),
+            "Added 1 image. Skipped 3 files: 2 GIF, 1 video."
+        );
+        assert_eq!(
+            intake_notice(0, false, &intake.skipped),
+            "Skipped 3 files: 2 GIF, 1 video."
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

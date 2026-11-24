@@ -6,7 +6,7 @@ use crate::files::{self, FilePrompt};
 use crate::model::{self, Decision, Encode, Recommendation, RowChoice};
 use crate::settings::{Preset, Settings};
 use crate::tools::{self, ToolPaths};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -295,7 +295,7 @@ impl OptimizerApp {
             app.open_picker(PickerPurpose::Images);
         }
         if let Ok(path) = std::env::var("IMAGE_OPTIMIZER_ADD") {
-            app.add_path(PathBuf::from(path));
+            app.add_paths(std::slice::from_ref(&PathBuf::from(path)));
         }
         app
     }
@@ -506,23 +506,43 @@ impl OptimizerApp {
                 .filter_map(|file| file.path.clone())
                 .collect()
         });
-        for path in dropped {
-            self.add_path(path);
+        if !dropped.is_empty() {
+            self.add_paths(&dropped);
         }
     }
 
-    fn add_path(&mut self, path: PathBuf) {
-        let found = files::collect_images(&path);
-        if found.is_empty() && path.is_file() {
-            self.push_row(path);
-            return;
-        }
-        for file in found {
-            if self.rows.len() >= files::MAX_IMAGES {
-                self.log = format!("Stopped at {} files.", files::MAX_IMAGES);
+    fn add_paths(&mut self, paths: &[PathBuf]) {
+        let mut skipped = BTreeMap::new();
+        let mut found_images = false;
+        let mut hit_limit = false;
+        let before = self.rows.len();
+        for path in paths {
+            let intake = files::collect_intake(path);
+            for (label, count) in intake.skipped {
+                *skipped.entry(label).or_default() += count;
+            }
+            for file in intake.images {
+                found_images = true;
+                if self.rows.len() >= files::MAX_IMAGES {
+                    hit_limit = true;
+                    break;
+                }
+                self.push_row(file);
+            }
+            if hit_limit {
                 break;
             }
-            self.push_row(file);
+        }
+        let added = self.rows.len() - before;
+        if hit_limit {
+            let mut message = format!("Stopped at {} files.", files::MAX_IMAGES);
+            if let Some(line) = files::skipped_summary(&skipped) {
+                message.push(' ');
+                message.push_str(&line);
+            }
+            self.log = message;
+        } else {
+            self.log = files::intake_notice(added, found_images, &skipped);
         }
     }
 
@@ -1512,7 +1532,7 @@ impl OptimizerApp {
                 {
                     let path = PathBuf::from(self.path_entry.trim());
                     if !path.as_os_str().is_empty() {
-                        self.add_path(path);
+                        self.add_paths(std::slice::from_ref(&path));
                         self.path_entry.clear();
                     }
                 }
@@ -1971,7 +1991,7 @@ impl OptimizerApp {
     fn add_native(&mut self, kind: NativePick) {
         let picked = std::panic::catch_unwind(|| match kind {
             NativePick::Files => rfd::FileDialog::new()
-                .add_filter("Images", &["jpg", "jpeg", "png", "webp"])
+                .add_filter("Images", &["jpg", "jpeg", "png", "webp", "heic", "heif"])
                 .pick_files()
                 .map(NativeResult::Files),
             NativePick::Output => rfd::FileDialog::new()
@@ -1980,9 +2000,7 @@ impl OptimizerApp {
         });
         match picked {
             Ok(Some(NativeResult::Files(paths))) => {
-                for path in paths {
-                    self.add_path(path);
-                }
+                self.add_paths(&paths);
             }
             Ok(Some(NativeResult::Output(path))) => {
                 self.settings.output_dir = Some(path);
@@ -2021,16 +2039,7 @@ impl OptimizerApp {
         }
         match outcome {
             PickerOutcome::Add(paths) => {
-                let count_before = self.rows.len();
-                for path in paths {
-                    self.add_path(path);
-                }
-                let added = self.rows.len() - count_before;
-                self.log = if added == 0 {
-                    "Those images are already in the list.".to_string()
-                } else {
-                    format!("Added {}.", plural(added, "image", "images"))
-                };
+                self.add_paths(&paths);
             }
             PickerOutcome::Output(path) => {
                 self.log = format!("Output folder: {}", path.display());
@@ -2190,7 +2199,7 @@ fn step_detail(kind: StepKind) -> &'static str {
     match kind {
         StepKind::NeedTools => "This copy of the app is missing its tools.",
         StepKind::Add => {
-            "JPEG, PNG, or WebP. Drop a file or a folder here, or use the button below."
+            "JPEG, PNG, WebP, or iPhone photos. Drop a file or a folder here, or use the button below."
         }
         StepKind::Optimize => {
             "Originals stay where they are. A copy is written only when it is smaller."
@@ -2869,6 +2878,7 @@ fn log_color(log: &str) -> egui::Color32 {
         || lower.starts_with("output folder")
         || lower.starts_with("stopped")
         || lower.starts_with("those images")
+        || lower.starts_with("skipped")
     {
         body_text()
     } else {

@@ -1,6 +1,6 @@
-//! Locates jpegoptim, pngcrush, and cwebp.
+//! Locates jpegoptim, pngcrush, cwebp, and heif-dec.
 //!
-//! Release builds embed the three binaries and extract them into the cache
+//! Release builds embed the binaries and extract them into the cache
 //! directory. They call `exit()` and keep process-global state, so they have
 //! to run as child processes. The OS can only exec a real file.
 
@@ -13,6 +13,7 @@ pub struct ToolPaths {
     pub jpegoptim: PathBuf,
     pub pngcrush: PathBuf,
     pub cwebp: PathBuf,
+    pub heif_dec: PathBuf,
 }
 
 impl ToolPaths {
@@ -21,8 +22,14 @@ impl ToolPaths {
             jpegoptim: dir.join(exe_name("jpegoptim")),
             pngcrush: dir.join(exe_name("pngcrush")),
             cwebp: dir.join(exe_name("cwebp")),
+            heif_dec: dir.join(exe_name("heif-dec")),
         };
-        for path in [&tools.jpegoptim, &tools.pngcrush, &tools.cwebp] {
+        for path in [
+            &tools.jpegoptim,
+            &tools.pngcrush,
+            &tools.cwebp,
+            &tools.heif_dec,
+        ] {
             if !path.is_file() {
                 return Err(format!("missing {}", path.display()));
             }
@@ -61,7 +68,7 @@ pub fn locate() -> Result<ToolPaths, String> {
     #[cfg(not(embed_tools))]
     {
         Err(
-            "jpegoptim, pngcrush, and cwebp were not found in bin/. Run scripts/build-tools.sh"
+            "jpegoptim, pngcrush, cwebp, and heif-dec were not found in bin/. Run scripts/build-tools.sh"
                 .into(),
         )
     }
@@ -103,6 +110,11 @@ fn install_embedded(dir: &Path) -> Result<(), String> {
         include_bytes!("../bin/pngcrush.exe"),
     )?;
     install_tool(dir, &exe_name("cwebp"), include_bytes!("../bin/cwebp.exe"))?;
+    install_tool(
+        dir,
+        &exe_name("heif-dec"),
+        include_bytes!("../bin/heif-dec.exe"),
+    )?;
     Ok(())
 }
 
@@ -119,6 +131,11 @@ fn install_embedded(dir: &Path) -> Result<(), String> {
         include_bytes!("../bin/pngcrush"),
     )?;
     install_tool(dir, &exe_name("cwebp"), include_bytes!("../bin/cwebp"))?;
+    install_tool(
+        dir,
+        &exe_name("heif-dec"),
+        include_bytes!("../bin/heif-dec"),
+    )?;
     Ok(())
 }
 

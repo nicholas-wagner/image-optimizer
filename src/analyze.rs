@@ -1,9 +1,11 @@
+use crate::heif;
 use crate::model::SourceFormat;
 use image::DynamicImage;
 use std::collections::HashSet;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const PNG_SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
 
@@ -25,7 +27,7 @@ pub fn analyze(path: &Path) -> Result<ImageInfo, String> {
     if header.len() >= 6 && (&header[..6] == b"GIF87a" || &header[..6] == b"GIF89a") {
         return Err("GIF is not supported".to_string());
     }
-    let format = sniff(&header).ok_or_else(|| "not a JPEG, PNG, or WebP".to_string())?;
+    let format = sniff(&header).ok_or_else(|| "not a JPEG, PNG, WebP, or HEIC".to_string())?;
     match format {
         SourceFormat::Png => {
             let (animated, has_alpha) = png_flags(&header)?;
@@ -65,6 +67,50 @@ pub fn analyze(path: &Path) -> Result<ImageInfo, String> {
                 bytes,
             })
         }
+        SourceFormat::Heif => inspect_heif(path, bytes),
+    }
+}
+
+/// Decode once so the list can show the upright size and whether there is transparency.
+fn inspect_heif(path: &Path, bytes: u64) -> Result<ImageInfo, String> {
+    let tools = crate::tools::locate()?;
+    let scratch = TempDir::new("heif-info")?;
+    let png = scratch.0.join("decoded.png");
+    heif::decode_to_png(&tools.heif_dec, path, &png)?;
+    let mut file = File::open(&png).map_err(|err| err.to_string())?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data).map_err(|err| err.to_string())?;
+    let (_animated, has_alpha) = png_flags(&data)?;
+    let (width, height) = dimensions(&png)?;
+    Ok(ImageInfo {
+        format: SourceFormat::Heif,
+        width,
+        height,
+        has_alpha,
+        bytes,
+    })
+}
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(label: &str) -> Result<Self, String> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "image-optimizer-{}-{label}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).map_err(|err| err.to_string())?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -75,9 +121,50 @@ pub fn sniff(header: &[u8]) -> Option<SourceFormat> {
         Some(SourceFormat::Png)
     } else if header.len() >= 12 && &header[..4] == b"RIFF" && &header[8..12] == b"WEBP" {
         Some(SourceFormat::Webp)
+    } else if is_heif(header) {
+        Some(SourceFormat::Heif)
     } else {
         None
     }
+}
+
+/// ISO-BMFF `ftyp` brands used by iPhone HEIC and other still HEIF photos.
+/// AVIF also lists `mif1`, so a file that names `avif` or `avis` is left alone.
+fn is_heif(header: &[u8]) -> bool {
+    if header.len() < 16 || &header[4..8] != b"ftyp" {
+        return false;
+    }
+    let box_size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    if box_size < 16 {
+        return false;
+    }
+    let end = box_size.min(header.len());
+    let mut offset = 8usize;
+    let mut brands = Vec::new();
+    while offset + 4 <= end {
+        // Byte 12 is the minor version, not a brand.
+        if offset != 12 {
+            brands.push([
+                header[offset],
+                header[offset + 1],
+                header[offset + 2],
+                header[offset + 3],
+            ]);
+        }
+        offset += 4;
+    }
+    if brands
+        .iter()
+        .any(|brand| brand == b"avif" || brand == b"avis")
+    {
+        return false;
+    }
+    brands.iter().any(|brand| {
+        matches!(
+            brand,
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"mif1" | b"msf1"
+        )
+    })
 }
 
 fn dimensions(path: &Path) -> Result<(u32, u32), String> {
@@ -179,5 +266,23 @@ mod tests {
         assert_eq!(sniff(b"\x89PNG\r\n\x1a\nrest"), Some(SourceFormat::Png));
         assert_eq!(sniff(b"RIFF0000WEBPmore"), Some(SourceFormat::Webp));
         assert_eq!(sniff(b"GIF89a"), None);
+        assert_eq!(sniff(&ftyp(b"heic", &[b"mif1"])), Some(SourceFormat::Heif));
+        assert_eq!(sniff(&ftyp(b"heix", &[])), Some(SourceFormat::Heif));
+        assert_eq!(sniff(&ftyp(b"mif1", &[b"heic"])), Some(SourceFormat::Heif));
+        assert_eq!(sniff(&ftyp(b"msf1", &[])), Some(SourceFormat::Heif));
+        assert_eq!(sniff(&ftyp(b"avif", &[b"mif1", b"avif"])), None);
+    }
+
+    fn ftyp(major: &[u8; 4], compatible: &[&[u8; 4]]) -> Vec<u8> {
+        let size = 16 + 4 * compatible.len();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(size as u32).to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(major);
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        for brand in compatible {
+            bytes.extend_from_slice(*brand);
+        }
+        bytes
     }
 }
